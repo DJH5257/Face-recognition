@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>人脸验证</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <h1>人脸验证</h1>
+          <p>上传基准人脸，开启摄像头，按 2-4 个随机动作完成人脸验证。</p>
+        </div>
+        <div class="pill" id="apiStatus">API 检测中</div>
+      </section>
+
+      <section class="grid">
+        <div class="panel">
+          <div class="panelHeader">
+            <h2>基准人脸</h2>
+            <span id="enrollState">未上传</span>
+          </div>
+          <label class="uploadBox">
+            <input id="photoInput" type="file" accept="image/jpeg,image/png,image/webp,image/bmp" />
+            <img id="previewImage" alt="" />
+            <span id="uploadHint">选择一张 8MB 内的清晰正脸照片</span>
+          </label>
+          <button id="uploadBtn" disabled>上传基准人脸</button>
+        </div>
+
+        <div class="panel">
+          <div class="panelHeader">
+            <h2>摄像头采集</h2>
+            <span id="cameraState">未开启</span>
+          </div>
+          <div class="videoWrap">
+            <video id="video" autoplay playsinline muted></video>
+            <canvas id="captureCanvas"></canvas>
+            <div class="instruction" id="instruction">等待摄像头</div>
+          </div>
+          <div class="buttonRow">
+            <button id="cameraBtn">开启摄像头</button>
+            <button id="closeCameraBtn" class="secondary" disabled>关闭摄像头</button>
+            <button id="challengeBtn" disabled>生成人脸验证动作</button>
+            <button id="captureBtn" disabled>开始人脸验证</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="statusGrid">
+        <div class="statusCard">
+          <span>动作指令</span>
+          <strong id="actionsText">-</strong>
+        </div>
+        <div class="statusCard">
+          <span>采集状态</span>
+          <strong id="livenessText">未检测</strong>
+        </div>
+        <div class="statusCard">
+          <span>相似度</span>
+          <strong id="similarityText">-</strong>
+        </div>
+        <div class="statusCard result">
+          <span>验证结果</span>
+          <strong id="resultText">等待验证</strong>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panelHeader">
+          <h2>动作明细</h2>
+          <span>后端返回 2-4 个动作，每个动作采集 2 秒</span>
+        </div>
+        <div id="actionDetails" class="details"></div>
+      </section>
+    </main>
+
+    <script src="/static/app.js?v=20260606-face-verify"></script>
+  </body>
+</html>

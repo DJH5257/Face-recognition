@@ -1,0 +1,11 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+opencv-contrib-python==4.10.0.84
+insightface==0.7.3
+onnxruntime==1.19.2
+mediapipe==0.10.20
+pydantic-settings==2.7.1
+urllib3==1.26.20

@@ -1,0 +1,21 @@
+face-verify-demo
+
+This project includes integration code for third-party libraries and model
+formats. The project source code is licensed under the MIT License.
+
+Third-party dependencies are installed from requirements.txt and are governed
+by their own licenses.
+
+Model assets are not distributed by default:
+
+- InsightFace model packs, such as buffalo_l, are downloaded by InsightFace at
+  runtime and are documented upstream as non-commercial research assets:
+  https://github.com/deepinsight/insightface/wiki/Dataset-Zoo
+- MiniFASNet ONNX weights must be obtained separately. Keep the source URL and
+  license for the exact weights used before redistribution. Common upstream
+  references include:
+  https://github.com/minivision-ai/Silent-Face-Anti-Spoofing
+  https://github.com/yakhyo/face-anti-spoofing
+
+Do not include biometric samples, captured frames, embeddings, identity
+documents, private logs, or secrets in public releases.

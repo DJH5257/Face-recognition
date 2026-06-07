@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# Runtime and local cache
+*.log
+*.tmp
+.DS_Store
+
+# Browser / editor
+.idea/
+.vscode/
+
+# User-provided biometric data and local captures
+uploads/
+captures/
+samples/
+test_images/
+
+# Third-party model weights are intentionally not distributed by default.
+# See models/README.md for source and license notes.
+models/*.onnx
+!models/README.md
