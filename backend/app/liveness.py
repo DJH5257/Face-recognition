@@ -20,7 +20,7 @@ ACTION_LABELS: Dict[str, str] = {
 }
 
 
-def random_actions(min_count: int = 2, max_count: int = 4) -> List[str]:
+def random_actions(min_count: int = 1, max_count: int = 3) -> List[str]:
     max_count = max(1, min(max_count, len(ACTION_LABELS)))
     min_count = max(1, min(min_count, max_count))
     count = min_count + secrets.randbelow(max_count - min_count + 1)

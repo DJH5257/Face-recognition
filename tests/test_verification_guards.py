@@ -14,10 +14,18 @@ from backend.app.liveness import ACTION_LABELS, random_actions
 from backend.app.main import (
     _analyze_live_faces,
     _match_live_face,
+    _select_deep_check_frames,
     _validate_frame_sequence,
     _validate_frame_uniqueness,
 )
 from backend.app.schemas import ChallengeRequest, CompareRequest, FramePayload, VerifyLivenessRequest
+from backend.app.schemas import (
+    ProofFinalizeRequest,
+    ProofIntrospectRequest,
+    TemplateCreateRequest,
+    VerificationSessionCreateRequest,
+    VerificationSessionVerifyRequest,
+)
 
 
 def make_frame(action, index, timestamp):
@@ -164,13 +172,39 @@ class VerificationGuardTests(unittest.TestCase):
                 threshold=0.01,
             )
 
-    def test_random_actions_use_default_two_to_four_unique_actions(self):
+        with self.assertRaises(ValidationError):
+            TemplateCreateRequest(
+                subject_type="doctor",
+                subject_id="83",
+                image="data:image/jpeg;base64,AAAA",
+                threshold=0.01,
+            )
+
+        with self.assertRaises(ValidationError):
+            VerificationSessionCreateRequest(
+                subject_type="doctor",
+                subject_id="83",
+                scene="login",
+                business_event_id="event",
+                template_id="client-must-not-choose",
+            )
+
+        with self.assertRaises(ValidationError):
+            VerificationSessionVerifyRequest(frames=[frame], subject_id="83")
+
+        with self.assertRaises(ValidationError):
+            ProofIntrospectRequest(proof_id="proof", scene="login")
+
+        with self.assertRaises(ValidationError):
+            ProofFinalizeRequest(business_event_id="event", threshold=0.01)
+
+    def test_random_actions_use_default_one_to_three_unique_actions(self):
         action_names = set(ACTION_LABELS)
         for _ in range(100):
             actions = random_actions()
 
-            self.assertGreaterEqual(len(actions), 2)
-            self.assertLessEqual(len(actions), 4)
+            self.assertGreaterEqual(len(actions), 1)
+            self.assertLessEqual(len(actions), 3)
             self.assertEqual(len(actions), len(set(actions)))
             self.assertTrue(set(actions).issubset(action_names))
 
@@ -178,8 +212,8 @@ class VerificationGuardTests(unittest.TestCase):
                 self.settings.liveness_action_min_count,
                 self.settings.liveness_action_max_count,
             )
-            self.assertGreaterEqual(len(configured_actions), 2)
-            self.assertLessEqual(len(configured_actions), 4)
+            self.assertGreaterEqual(len(configured_actions), 1)
+            self.assertLessEqual(len(configured_actions), 3)
 
     def test_live_face_analysis_rejects_multiple_faces(self):
         original_engine = main.face_engine
@@ -194,6 +228,24 @@ class VerificationGuardTests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertIsNone(result.embedding)
         self.assertIn("多张人脸", result.detail)
+
+    def test_deep_check_frames_are_distributed_by_action(self):
+        settings = Settings(face_match_embedding_sample=6, anti_spoofing_sample_frames=6)
+        actions = ["blink", "mouth_open", "shake_head", "nod_head"]
+        frames_by_action = {
+            action: [
+                np.full((8, 8, 3), action_index * 50 + frame_index, dtype=np.uint8)
+                for frame_index in range(11)
+            ]
+            for action_index, action in enumerate(actions)
+        }
+
+        selected = _select_deep_check_frames(frames_by_action, actions, settings)
+
+        self.assertEqual(len(selected), 8)
+        selected_values = [int(frame[0, 0, 0]) for frame in selected]
+        for action_index in range(len(actions)):
+            self.assertTrue(any(action_index * 50 <= value < action_index * 50 + 11 for value in selected_values))
 
     def test_face_match_requires_threshold_ratio_and_min_similarity(self):
         enrollment = np.array([1.0, 0.0], dtype=np.float32)
@@ -373,7 +425,7 @@ class patched_verification_pipeline:
         main.verify_liveness_actions = self.original_actions
         main.anti_spoofing_model = self.original_spoofing
 
-    def _face_check(self, frames, _settings):
+    def _face_check(self, frames, _settings, **_kwargs):
         embedding = main._mean_embedding(self.live_embeddings)
         return main.LiveFaceCheck(
             passed=True,

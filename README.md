@@ -1,24 +1,25 @@
 # Face Verify Demo
 
-基于 FastAPI 的人脸验证和交互式活体检测 Demo。项目不包含登录、数据库、账号系统或生产级风控，适合用于学习、原型验证和离线评估流程。
+基于 FastAPI 的人脸验证和交互式活体检测服务。项目仍不包含登录、账号和业务权限系统，但已提供可供业务系统调用的模板、核验会话和一次性 proof 接口；业务系统负责决定谁扫脸、何时扫脸以及最终业务放行。
 
 ## 功能
 
 - 上传一张本人基准人脸照片，使用 InsightFace / ArcFace 提取人脸特征。
 - 浏览器通过 `getUserMedia` 打开摄像头。
-- 后端随机生成 2-4 个动作：眨眼、张嘴、摇头、点头、微笑。
+- 后端随机生成 1-3 个动作：眨眼、张嘴、摇头、点头、微笑。
 - 前端按动作连续采集摄像头帧，后端用 MediaPipe FaceMesh 判断动作是否完成。
 - 活体检测通过后，才允许做 1:1 人脸特征比对。
 - 验证同时检查动作完成度、帧连续性、重复帧、人脸稳定性、防翻拍和人脸一致性。
+- 生产接口使用服务端模板、短期上传 token 和一次性 proof，业务系统不再依赖单图 `/api/compare` 放行。
 
 ## 重要声明
 
-本项目是 Demo，不是生产身份认证系统。
+本项目只负责人脸核验判定，不替代业务系统的登录、权限、审计和风控。
 
 - 不要把默认阈值直接用于真实业务。
 - 不要向公开仓库提交真实人脸照片、摄像头帧、人脸特征、身份资料或业务数据。
 - RGB 摄像头活体和 PAD 模型是概率检测，无法保证拦截所有照片、屏幕、视频回放、面具、深度伪造或对抗样本。
-- 生产环境还需要身份系统、鉴权、限流、审计、设备风险、摄像头流完整性校验、合规评估和专门的 PAD 数据集测试。
+- 生产环境还需要业务系统在最终写入口强制消费 proof，并配合限流、审计、设备风险、摄像头流完整性校验、合规评估和专门的 PAD 数据集测试。
 
 ## 模型和许可证
 
@@ -40,7 +41,7 @@ face-verify-demo/
       liveness.py          # Random liveness actions and action checks
       anti_spoofing.py     # MiniFASNet ONNX inference
       schemas.py           # API request / response models
-      stores.py            # In-memory enrollment and challenge store
+      stores.py            # Demo 内存 enrollment/challenge + SQLite template/session/proof store
     static/
       index.html
       styles.css
@@ -100,8 +101,15 @@ cp .env.example .env
 FACE_DEMO_FACE_MATCH_THRESHOLD=0.42
 FACE_DEMO_FACE_MATCH_MIN_THRESHOLD=0.30
 FACE_DEMO_FACE_MATCH_MIN_PASS_RATIO=0.65
-FACE_DEMO_LIVENESS_ACTION_MIN_COUNT=2
-FACE_DEMO_LIVENESS_ACTION_MAX_COUNT=4
+FACE_DEMO_DATABASE_PATH=data/face_verify.sqlite3
+FACE_DEMO_INTERNAL_API_KEY=change-me-face-internal-key
+FACE_DEMO_CORS_ORIGINS=*
+FACE_DEMO_VERIFICATION_SESSION_TTL_SECONDS=300
+FACE_DEMO_PROOF_TTL_SECONDS=300
+FACE_DEMO_INSIGHTFACE_MODEL=buffalo_l
+FACE_DEMO_INSIGHTFACE_ROOT=/opt/face-verify-demo/shared/insightface-home/.insightface
+FACE_DEMO_LIVENESS_ACTION_MIN_COUNT=1
+FACE_DEMO_LIVENESS_ACTION_MAX_COUNT=3
 FACE_DEMO_MIN_FRAMES_PER_ACTION=6
 FACE_DEMO_MAX_TOTAL_FRAMES=72
 FACE_DEMO_ANTI_SPOOFING_THRESHOLD=0.35
@@ -110,9 +118,154 @@ FACE_DEMO_ANTI_SPOOFING_MODEL_PATH=models/MiniFASNetV1SE.onnx,models/MiniFASNetV
 
 阈值需要用你的摄像头、光照、真人样本、照片、屏幕、视频回放和低性能设备重新校准。
 
+## 生产部署建议
+
+为了保持本地和线上效果一致，生产环境不要关闭任何一层检测：保留 InsightFace 检测与 ArcFace 特征比对、MediaPipe 随机动作活体、MiniFASNet 防翻拍、多帧连续性和人脸一致性校验。
+
+推荐服务器至少 2 核 4GB 内存；更稳妥为 4 核 8GB。1 核 2GB 或 2 核 2GB 机器可以启动页面和接口，但首次加载 `buffalo_l`/ArcFace 模型可能非常慢，甚至拖慢 SSH 和其它服务。不要通过降低阈值、减少防翻拍或删除活体动作来规避这个问题，应该换更合适的服务器规格。
+
+上线前把所有运行资源上传到服务器，避免首次请求时联网下载：
+
+```text
+/opt/face-verify-demo/current/                  # 当前代码
+/opt/face-verify-demo/shared/.venv/             # Python 虚拟环境
+/opt/face-verify-demo/shared/insightface-home/.insightface/models/buffalo_l/
+  det_10g.onnx
+  w600k_r50.onnx
+  2d106det.onnx
+  1k3d68.onnx
+  genderage.onnx
+/opt/face-verify-demo/current/models/
+  MiniFASNetV1SE.onnx
+  MiniFASNetV2.yakhyo.onnx
+```
+
+`FACE_DEMO_INSIGHTFACE_ROOT` 必须指向包含 `models/` 子目录的 `.insightface` 根目录，例如：
+
+```bash
+FACE_DEMO_INSIGHTFACE_MODEL=buffalo_l
+FACE_DEMO_INSIGHTFACE_ROOT=/opt/face-verify-demo/shared/insightface-home/.insightface
+```
+
+高配服务器不建议设置 ONNXRuntime 线程数，让运行时按硬件自动调度以获得最佳识别性能。只有在低配机器上出现冷启动 CPU 打满时，才临时设置：
+
+```bash
+FACE_DEMO_ONNX_INTRA_OP_THREADS=1
+FACE_DEMO_ONNX_INTER_OP_THREADS=1
+```
+
+公网摄像头采集必须使用 HTTPS。没有域名时可以先用带 IP SAN 的自签证书测试；正式环境建议使用域名和可信证书。部署后至少验证：
+
+```bash
+curl -k https://<host>:<port>/api/health
+curl -k https://<host>:<port>/api/ready
+curl -k -I https://<host>:<port>/static/app.js?v=20260606-face-verify
+PYTHONPYCACHEPREFIX=/tmp/face-verify-demo-pycache .venv/bin/python -m unittest discover -s tests -v
+```
+
 ## API
 
-### 上传基准人脸
+### 健康与就绪
+
+```http
+GET /api/health
+GET /api/ready
+```
+
+`/api/health` 只表示进程可响应。`/api/ready` 会检查 SQLite 数据目录和 PAD 模型文件是否存在，不会预加载 InsightFace 或 PAD 大模型，避免探活拖慢低配机器。
+
+### 生产接口鉴权
+
+所有 `/v1/internal/*` 接口仅供 `chbzg` 后端调用，必须携带：
+
+```http
+X-Face-Api-Key: <FACE_DEMO_INTERNAL_API_KEY>
+```
+
+浏览器只允许调用 `/v1/verification-sessions/{session_id}/verify`，并使用 `chbzg` 从人脸服务拿到的短期上传令牌：
+
+```http
+Authorization: Bearer <upload_token>
+```
+
+浏览器不能指定人员 ID、模板 ID、业务场景、业务事件、阈值或动作列表。
+
+### 生产：登记模板
+
+```http
+POST /v1/internal/templates
+Content-Type: application/json
+X-Face-Api-Key: ...
+```
+
+```json
+{
+  "subject_type": "doctor",
+  "subject_id": "83",
+  "image": "data:image/jpeg;base64,...",
+  "source_type": "avatar",
+  "request_id": "optional-id"
+}
+```
+
+成功后返回 `template_id`、`template_version` 和 bbox，不返回 embedding。同一人员新增模板会原子吊销旧 active 模板。
+
+### 生产：创建核验会话
+
+```http
+POST /v1/internal/verification-sessions
+Content-Type: application/json
+X-Face-Api-Key: ...
+```
+
+```json
+{
+  "request_id": "login-2112-20260612",
+  "subject_type": "doctor",
+  "subject_id": "83",
+  "admin_id": "2112",
+  "scene": "doctor_audit",
+  "business_event_id": "biz-event-id",
+  "record_id": "record-id",
+  "action": "audit"
+}
+```
+
+服务端生成 1-3 个随机动作、绑定 active 模板并返回 `session_id`、`upload_token`、`actions` 和 `expires_at`。相同 `request_id` 会返回同一会话。
+
+### 生产：提交连续帧核验
+
+```http
+POST /v1/verification-sessions/{session_id}/verify
+Authorization: Bearer <upload_token>
+Content-Type: application/json
+```
+
+```json
+{
+  "frames": [
+    {
+      "action": "blink",
+      "index": 0,
+      "timestamp": 123456.7,
+      "image": "data:image/jpeg;base64,..."
+    }
+  ]
+}
+```
+
+只有动作、重复帧、单人脸稳定性、PAD 和本人比对全部通过才签发 `proof_id`。失败不会签发 proof。
+
+### 生产：查询和完成 proof
+
+```http
+POST /v1/internal/proofs/introspect
+POST /v1/internal/proofs/{proof_id}/finalize
+```
+
+`introspect` 返回 proof 是否仍有效以及绑定的人员、场景、业务事件、记录、动作和模板版本。`finalize` 必须传入相同 `business_event_id`；业务系统应在自身事务成功后调用它。
+
+### Demo：上传基准人脸
 
 ```http
 POST /api/enroll
@@ -123,7 +276,7 @@ file=<image>
 
 如果没有检测到人脸，返回 `400`。如果检测到多张人脸，也会返回 `400`。
 
-### 生成随机活体动作
+### Demo：生成随机活体动作
 
 ```http
 POST /api/liveness/challenge
@@ -149,7 +302,7 @@ Content-Type: application/json
 }
 ```
 
-### 提交摄像头帧做活体检测
+### Demo：提交摄像头帧做活体检测
 
 ```http
 POST /api/liveness/verify
@@ -171,7 +324,7 @@ Content-Type: application/json
 }
 ```
 
-### 活体通过后做人脸比对
+### Demo：活体通过后的人脸比对（兼容旧流程）
 
 ```http
 POST /api/compare
@@ -187,10 +340,14 @@ Content-Type: application/json
 
 未通过活体时调用该接口会返回 `403`。
 
+当前前端默认在 `/api/liveness/verify` 里直接拿到最终结果，`/api/compare` 仅保留兼容调用。
+
+生产业务放行不要依赖 `/api/compare`，应使用 `/v1` 签发的一次性 proof。
+
 ## 测试
 
 ```bash
-PYTHONPYCACHEPREFIX=/private/tmp/face-verify-demo-pycache python -m py_compile backend/app/*.py tests/test_verification_guards.py
+PYTHONPYCACHEPREFIX=/private/tmp/face-verify-demo-pycache python -m py_compile backend/app/*.py tests/*.py
 PYTHONPYCACHEPREFIX=/private/tmp/face-verify-demo-pycache python -m unittest discover -s tests -v
 node --check backend/static/app.js
 node scripts/test_frontend_static.js

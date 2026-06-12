@@ -9,9 +9,39 @@ from typing import List, Optional
 
 import cv2
 import numpy as np
+import onnxruntime as ort
 
 os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/face-verify-demo-matplotlib")
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+
+_ORIGINAL_INFERENCE_SESSION_INIT = ort.InferenceSession.__init__
+
+
+def _optional_positive_int(value: Optional[str]) -> Optional[int]:
+    if value is None or not value.strip():
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _bounded_inference_session_init(self, *args, **kwargs):
+    if kwargs.get("sess_options") is None:
+        intra_threads = _optional_positive_int(os.environ.get("FACE_DEMO_ONNX_INTRA_OP_THREADS"))
+        inter_threads = _optional_positive_int(os.environ.get("FACE_DEMO_ONNX_INTER_OP_THREADS"))
+        if intra_threads or inter_threads:
+            options = ort.SessionOptions()
+            if intra_threads:
+                options.intra_op_num_threads = intra_threads
+            if inter_threads:
+                options.inter_op_num_threads = inter_threads
+            kwargs["sess_options"] = options
+    return _ORIGINAL_INFERENCE_SESSION_INIT(self, *args, **kwargs)
+
+
+ort.InferenceSession.__init__ = _bounded_inference_session_init
 
 from insightface.app import FaceAnalysis
 
@@ -34,6 +64,8 @@ class FaceEngine:
         if self._app is None:
             app = FaceAnalysis(
                 name=self.settings.insightface_model,
+                root=self.settings.insightface_root,
+                allowed_modules=["detection", "recognition"],
                 providers=self.settings.insightface_providers,
             )
             app.prepare(

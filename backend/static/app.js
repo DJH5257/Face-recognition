@@ -276,18 +276,7 @@ els.captureBtn.addEventListener("click", async () => {
       setResult(live.message, false);
       return;
     }
-
-    const compared = await requestJson("/api/compare", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        enrollment_id: state.enrollmentId,
-        challenge_id: state.challengeId,
-      }),
-      timeoutMs: 20000,
-    });
-    els.similarityText.textContent = compared.similarity.toFixed(4);
-    setResult(compared.message, compared.matched);
+    setResult(live.message, true);
   } catch (err) {
     els.livenessText.textContent = err.message.includes("活体") ? "失败" : els.livenessText.textContent;
     setResult(err.message, false);

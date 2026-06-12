@@ -1,10 +1,62 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from secrets import token_urlsafe
 from threading import Lock
 from typing import Dict, List, Optional
 from uuid import uuid4
 
 import numpy as np
+
+from .config import get_settings
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _to_iso(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _from_iso(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _embedding_to_blob(embedding: np.ndarray) -> tuple[bytes, int]:
+    normalized = np.asarray(embedding, dtype=np.float32)
+    return normalized.tobytes(), int(normalized.size)
+
+
+def _embedding_from_blob(blob: bytes, dimension: int) -> np.ndarray:
+    embedding = np.frombuffer(blob, dtype=np.float32, count=dimension).copy()
+    norm = max(float(np.linalg.norm(embedding)), 1e-12)
+    return (embedding / norm).astype(np.float32)
+
+
+def _token_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name not in columns:
+        default_value = "''" if column_type.upper().startswith("TEXT") else "0"
+        conn.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type} NOT NULL DEFAULT {default_value}"
+        )
 
 
 @dataclass
@@ -12,7 +64,7 @@ class Enrollment:
     id: str
     embedding: np.ndarray
     bbox: List[float]
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=_utcnow)
 
 
 @dataclass
@@ -26,18 +78,90 @@ class Challenge:
     face_matched: bool = False
     face_similarity: Optional[float] = None
     action_results: List[dict] = field(default_factory=list)
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=_utcnow)
     verified_at: Optional[datetime] = None
 
     def is_expired(self) -> bool:
-        return datetime.now(timezone.utc) > self.expires_at
+        return _utcnow() > self.expires_at
 
 
-class MemoryStore:
-    def __init__(self) -> None:
+@dataclass
+class FaceTemplate:
+    template_id: str
+    subject_type: str
+    subject_id: str
+    embedding: np.ndarray
+    bbox: List[float]
+    template_version: int
+    status: str
+    source_type: str
+    source_image_hash: Optional[str]
+    created_at: datetime
+    activated_at: Optional[datetime]
+    revoked_at: Optional[datetime]
+
+
+@dataclass
+class VerificationSession:
+    session_id: str
+    request_id: Optional[str]
+    subject_type: str
+    subject_id: str
+    admin_id: Optional[str]
+    scene: str
+    business_event_id: str
+    record_id: Optional[str]
+    action: Optional[str]
+    template_id: str
+    template_version: int
+    expected_actions: List[str]
+    upload_token: str
+    status: str
+    result_code: str
+    issued_at: datetime
+    expires_at: datetime
+    verified_at: Optional[datetime]
+    proof_id: Optional[str]
+
+    def is_expired(self) -> bool:
+        return _utcnow() > self.expires_at
+
+
+@dataclass
+class VerificationProof:
+    proof_id: str
+    session_id: str
+    business_event_id: str
+    subject_type: str
+    subject_id: str
+    admin_id: Optional[str]
+    scene: str
+    record_id: Optional[str]
+    action: Optional[str]
+    template_id: str
+    template_version: int
+    status: str
+    result_code: str
+    issued_at: datetime
+    expires_at: datetime
+    finalized_at: Optional[datetime]
+
+    def is_expired(self) -> bool:
+        return _utcnow() > self.expires_at
+
+    @property
+    def valid(self) -> bool:
+        return self.status == "ready" and not self.is_expired()
+
+
+class Store:
+    def __init__(self, database_path: Optional[str] = None) -> None:
+        settings = get_settings()
+        self.database_path = Path(database_path or settings.database_path).expanduser()
         self._lock = Lock()
         self.enrollments: Dict[str, Enrollment] = {}
         self.challenges: Dict[str, Challenge] = {}
+        self._init_db()
 
     def create_enrollment(self, embedding: np.ndarray, bbox: List[float]) -> Enrollment:
         item = Enrollment(id=str(uuid4()), embedding=embedding, bbox=bbox)
@@ -59,7 +183,7 @@ class MemoryStore:
             id=str(uuid4()),
             actions=actions,
             enrollment_id=enrollment_id,
-            expires_at=datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds),
+            expires_at=_utcnow() + timedelta(seconds=ttl_seconds),
         )
         with self._lock:
             self.challenges[item.id] = item
@@ -68,6 +192,484 @@ class MemoryStore:
     def get_challenge(self, challenge_id: str) -> Optional[Challenge]:
         with self._lock:
             return self.challenges.get(challenge_id)
+
+    def create_template(
+        self,
+        subject_type: str,
+        subject_id: str,
+        embedding: np.ndarray,
+        bbox: List[float],
+        source_type: str,
+        source_image_hash: Optional[str],
+    ) -> FaceTemplate:
+        template_id = str(uuid4())
+        now = _utcnow()
+        embedding_blob, dimension = _embedding_to_blob(embedding)
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            latest = conn.execute(
+                """
+                SELECT COALESCE(MAX(template_version), 0) AS version
+                FROM face_templates
+                WHERE subject_type = ? AND subject_id = ?
+                """,
+                (subject_type, subject_id),
+            ).fetchone()
+            template_version = int(latest["version"]) + 1
+            conn.execute(
+                """
+                UPDATE face_templates
+                SET status = 'revoked', revoked_at = ?
+                WHERE subject_type = ? AND subject_id = ? AND status = 'active'
+                """,
+                (_to_iso(now), subject_type, subject_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO face_templates (
+                    template_id, subject_type, subject_id, embedding_blob,
+                    embedding_dimension, bbox_json, template_version, status,
+                    source_type, source_image_hash, created_at, activated_at, revoked_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL)
+                """,
+                (
+                    template_id,
+                    subject_type,
+                    subject_id,
+                    embedding_blob,
+                    dimension,
+                    json.dumps([float(value) for value in bbox]),
+                    template_version,
+                    source_type,
+                    source_image_hash,
+                    _to_iso(now),
+                    _to_iso(now),
+                ),
+            )
+            conn.commit()
+        template = self.get_template(template_id)
+        if template is None:
+            raise RuntimeError("template insert succeeded but could not be loaded")
+        return template
+
+    def get_template(self, template_id: str) -> Optional[FaceTemplate]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM face_templates WHERE template_id = ?",
+                (template_id,),
+            ).fetchone()
+        return _row_to_template(row) if row else None
+
+    def get_active_template(self, subject_type: str, subject_id: str) -> Optional[FaceTemplate]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM face_templates
+                WHERE subject_type = ? AND subject_id = ? AND status = 'active'
+                ORDER BY template_version DESC
+                LIMIT 1
+                """,
+                (subject_type, subject_id),
+            ).fetchone()
+        return _row_to_template(row) if row else None
+
+    def create_verification_session(
+        self,
+        request_id: Optional[str],
+        subject_type: str,
+        subject_id: str,
+        admin_id: Optional[str],
+        scene: str,
+        business_event_id: str,
+        record_id: Optional[str],
+        action: Optional[str],
+        expected_actions: List[str],
+        ttl_seconds: int,
+    ) -> Optional[VerificationSession]:
+        template = self.get_active_template(subject_type, subject_id)
+        if template is None:
+            return None
+        if request_id:
+            existing = self.get_session_by_request_id(request_id)
+            if existing is not None:
+                return existing
+
+        session_id = str(uuid4())
+        upload_token = token_urlsafe(32)
+        now = _utcnow()
+        expires_at = now + timedelta(seconds=ttl_seconds)
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO verification_sessions (
+                        session_id, request_id, subject_type, subject_id, admin_id,
+                        scene, business_event_id, record_id, action, template_id,
+                        template_version, expected_actions_json, upload_token,
+                        upload_token_hash, status, result_code, issued_at, expires_at,
+                        verified_at, proof_id
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', 'ISSUED', ?, ?, NULL, NULL)
+                    """,
+                    (
+                        session_id,
+                        request_id,
+                        subject_type,
+                        subject_id,
+                        admin_id,
+                        scene,
+                        business_event_id,
+                        record_id,
+                        action,
+                        template.template_id,
+                        template.template_version,
+                        json.dumps(expected_actions),
+                        upload_token,
+                        _token_hash(upload_token),
+                        _to_iso(now),
+                        _to_iso(expires_at),
+                    ),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                if request_id:
+                    return self.get_session_by_request_id(request_id)
+                raise
+        return self.get_session(session_id)
+
+    def get_session(self, session_id: str) -> Optional[VerificationSession]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM verification_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return _row_to_session(row) if row else None
+
+    def get_session_by_request_id(self, request_id: str) -> Optional[VerificationSession]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM verification_sessions WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+        return _row_to_session(row) if row else None
+
+    def verify_upload_token(self, session_id: str, upload_token: str) -> bool:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT upload_token_hash FROM verification_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return bool(row and row["upload_token_hash"] == _token_hash(upload_token))
+
+    def start_session_verification(self, session_id: str) -> bool:
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                UPDATE verification_sessions
+                SET status = 'verifying'
+                WHERE session_id = ? AND status = 'issued'
+                """,
+                (session_id,),
+            )
+            conn.commit()
+        return row.rowcount == 1
+
+    def mark_session_failed(self, session_id: str, result_code: str) -> None:
+        now = _utcnow()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE verification_sessions
+                SET status = 'failed', result_code = ?, verified_at = ?
+                WHERE session_id = ?
+                """,
+                (result_code, _to_iso(now), session_id),
+            )
+
+    def reset_session_verification(self, session_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE verification_sessions
+                SET status = 'issued', result_code = 'ISSUED', verified_at = NULL
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            )
+
+    def create_proof_for_session(
+        self,
+        session_id: str,
+        result_code: str,
+        ttl_seconds: int,
+    ) -> Optional[VerificationProof]:
+        now = _utcnow()
+        expires_at = now + timedelta(seconds=ttl_seconds)
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            session = conn.execute(
+                "SELECT * FROM verification_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                conn.rollback()
+                return None
+            existing = conn.execute(
+                "SELECT * FROM verification_proofs WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if existing is not None:
+                conn.commit()
+                return _row_to_proof(existing)
+
+            proof_id = str(uuid4())
+            conn.execute(
+                """
+                INSERT INTO verification_proofs (
+                    proof_id, session_id, business_event_id, subject_type, subject_id,
+                    admin_id, scene, record_id, action, template_id, template_version,
+                    status, result_code, issued_at, expires_at, finalized_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, NULL)
+                """,
+                (
+                    proof_id,
+                    session_id,
+                    session["business_event_id"],
+                    session["subject_type"],
+                    session["subject_id"],
+                    session["admin_id"],
+                    session["scene"],
+                    session["record_id"],
+                    session["action"],
+                    session["template_id"],
+                    session["template_version"],
+                    result_code,
+                    _to_iso(now),
+                    _to_iso(expires_at),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE verification_sessions
+                SET status = 'passed', result_code = ?, verified_at = ?, proof_id = ?
+                WHERE session_id = ?
+                """,
+                (result_code, _to_iso(now), proof_id, session_id),
+            )
+            proof = conn.execute(
+                "SELECT * FROM verification_proofs WHERE proof_id = ?",
+                (proof_id,),
+            ).fetchone()
+            conn.commit()
+        return _row_to_proof(proof) if proof else None
+
+    def get_proof(self, proof_id: str) -> Optional[VerificationProof]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM verification_proofs WHERE proof_id = ?",
+                (proof_id,),
+            ).fetchone()
+        return _row_to_proof(row) if row else None
+
+    def finalize_proof(self, proof_id: str, business_event_id: str) -> Optional[VerificationProof]:
+        now = _utcnow()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            proof = conn.execute(
+                "SELECT * FROM verification_proofs WHERE proof_id = ?",
+                (proof_id,),
+            ).fetchone()
+            if proof is None:
+                conn.rollback()
+                return None
+            if proof["business_event_id"] != business_event_id:
+                conn.rollback()
+                raise ValueError("proof 与业务事件不一致")
+            if proof["status"] == "ready":
+                expires_at = _from_iso(proof["expires_at"])
+                if expires_at and _utcnow() > expires_at:
+                    conn.execute(
+                        "UPDATE verification_proofs SET status = 'expired' WHERE proof_id = ?",
+                        (proof_id,),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE verification_proofs
+                        SET status = 'finalized', finalized_at = ?
+                        WHERE proof_id = ?
+                        """,
+                        (_to_iso(now), proof_id),
+                    )
+            updated = conn.execute(
+                "SELECT * FROM verification_proofs WHERE proof_id = ?",
+                (proof_id,),
+            ).fetchone()
+            conn.commit()
+        return _row_to_proof(updated) if updated else None
+
+    def _connect(self) -> sqlite3.Connection:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self.database_path), timeout=15, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=15000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _init_db(self) -> None:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock, self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS face_templates (
+                    template_id TEXT PRIMARY KEY,
+                    subject_type TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    embedding_blob BLOB NOT NULL,
+                    embedding_dimension INTEGER NOT NULL,
+                    bbox_json TEXT NOT NULL,
+                    template_version INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    source_image_hash TEXT,
+                    created_at TEXT NOT NULL,
+                    activated_at TEXT,
+                    revoked_at TEXT
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_face_templates_active
+                    ON face_templates(subject_type, subject_id)
+                    WHERE status = 'active';
+
+                CREATE INDEX IF NOT EXISTS idx_face_templates_subject
+                    ON face_templates(subject_type, subject_id, template_version);
+
+                CREATE TABLE IF NOT EXISTS verification_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    request_id TEXT UNIQUE,
+                    subject_type TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    admin_id TEXT,
+                    scene TEXT NOT NULL,
+                    business_event_id TEXT NOT NULL,
+                    record_id TEXT,
+                    action TEXT,
+                    template_id TEXT NOT NULL,
+                    template_version INTEGER NOT NULL,
+                    expected_actions_json TEXT NOT NULL,
+                    upload_token TEXT NOT NULL,
+                    upload_token_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_code TEXT NOT NULL,
+                    issued_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    verified_at TEXT,
+                    proof_id TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_verification_sessions_event
+                    ON verification_sessions(business_event_id, scene, subject_type, subject_id);
+
+                CREATE TABLE IF NOT EXISTS verification_proofs (
+                    proof_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL UNIQUE,
+                    business_event_id TEXT NOT NULL,
+                    subject_type TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    admin_id TEXT,
+                    scene TEXT NOT NULL,
+                    record_id TEXT,
+                    action TEXT,
+                    template_id TEXT NOT NULL,
+                    template_version INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    result_code TEXT NOT NULL,
+                    issued_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    finalized_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_verification_proofs_event
+                    ON verification_proofs(business_event_id, scene, subject_type, subject_id);
+                """
+            )
+            _ensure_column(conn, "verification_sessions", "upload_token", "TEXT")
+
+
+class MemoryStore(Store):
+    """Compatibility alias for tests and older demo imports."""
+
+
+def _row_to_template(row: sqlite3.Row) -> FaceTemplate:
+    return FaceTemplate(
+        template_id=row["template_id"],
+        subject_type=row["subject_type"],
+        subject_id=row["subject_id"],
+        embedding=_embedding_from_blob(row["embedding_blob"], int(row["embedding_dimension"])),
+        bbox=[float(value) for value in json.loads(row["bbox_json"])],
+        template_version=int(row["template_version"]),
+        status=row["status"],
+        source_type=row["source_type"],
+        source_image_hash=row["source_image_hash"],
+        created_at=_from_iso(row["created_at"]) or _utcnow(),
+        activated_at=_from_iso(row["activated_at"]),
+        revoked_at=_from_iso(row["revoked_at"]),
+    )
+
+
+def _row_to_session(row: sqlite3.Row) -> VerificationSession:
+    return VerificationSession(
+        session_id=row["session_id"],
+        request_id=row["request_id"],
+        subject_type=row["subject_type"],
+        subject_id=row["subject_id"],
+        admin_id=row["admin_id"],
+        scene=row["scene"],
+        business_event_id=row["business_event_id"],
+        record_id=row["record_id"],
+        action=row["action"],
+        template_id=row["template_id"],
+        template_version=int(row["template_version"]),
+        expected_actions=list(json.loads(row["expected_actions_json"])),
+        upload_token=row["upload_token"],
+        status=row["status"],
+        result_code=row["result_code"],
+        issued_at=_from_iso(row["issued_at"]) or _utcnow(),
+        expires_at=_from_iso(row["expires_at"]) or _utcnow(),
+        verified_at=_from_iso(row["verified_at"]),
+        proof_id=row["proof_id"],
+    )
+
+
+def _row_to_proof(row: sqlite3.Row) -> VerificationProof:
+    status = row["status"]
+    expires_at = _from_iso(row["expires_at"]) or _utcnow()
+    if status == "ready" and _utcnow() > expires_at:
+        status = "expired"
+    return VerificationProof(
+        proof_id=row["proof_id"],
+        session_id=row["session_id"],
+        business_event_id=row["business_event_id"],
+        subject_type=row["subject_type"],
+        subject_id=row["subject_id"],
+        admin_id=row["admin_id"],
+        scene=row["scene"],
+        record_id=row["record_id"],
+        action=row["action"],
+        template_id=row["template_id"],
+        template_version=int(row["template_version"]),
+        status=status,
+        result_code=row["result_code"],
+        issued_at=_from_iso(row["issued_at"]) or _utcnow(),
+        expires_at=expires_at,
+        finalized_at=_from_iso(row["finalized_at"]),
+    )
 
 
 store = MemoryStore()

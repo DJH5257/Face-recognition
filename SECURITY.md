@@ -17,7 +17,8 @@ Do not open public issues or pull requests containing real face images, camera c
 
 ## Known Security Limits
 
-- The demo uses in-memory state and has no authentication, authorization, rate limiting, persistence, audit trail, or fraud-risk engine.
+- Legacy demo routes still keep enrollment/challenge state in memory, while production template/session/proof data is persisted in SQLite.
+- The service still requires business-side authentication, authorization, rate limiting, audit trail, device risk checks, and fraud controls around the verification flow.
 - Browser frames and timestamps are client supplied and can be manipulated by an attacker.
 - RGB camera liveness and anti-spoofing models are probabilistic and can fail under new cameras, lighting, replay media, masks, deepfakes, or adversarial inputs.
 - Default thresholds are demo defaults only and must be calibrated on representative live and attack samples.

@@ -88,6 +88,10 @@ class AntiSpoofingModel:
             passed_frame_ratio=passed_frame_ratio,
         )
 
+    def preload(self) -> None:
+        with self._lock:
+            self._ensure_sessions()
+
     def _ensure_sessions(self) -> List[Tuple[ort.InferenceSession, str, float]]:
         if self._sessions is None:
             model_paths = [

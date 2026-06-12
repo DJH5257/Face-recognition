@@ -14,6 +14,10 @@ assert(
   html.includes("/static/app.js?v=20260606-face-verify"),
   "index.html must load the versioned app.js to avoid stale browser cache",
 );
+assert(
+  !appJs.includes('"/api/compare"'),
+  "frontend should no longer call the legacy compare endpoint",
+);
 
 const elements = new Map();
 function element(id) {
