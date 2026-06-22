@@ -9,6 +9,7 @@ import secrets
 from typing import Optional
 
 import cv2
+import mediapipe as mp
 import numpy as np
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from .anti_spoofing import AntiSpoofingModel
 from .config import Settings, get_settings
 from .face_engine import FaceEngine, cosine_similarity, decode_base64_image, decode_image_bytes
-from .liveness import ACTION_LABELS, random_actions, verify_liveness_actions
+from .liveness import ACTION_LABELS, _extract_metrics, random_actions, verify_liveness_actions
 from .schemas import (
     ChallengeRequest,
     ChallengeResponse,
@@ -31,6 +32,9 @@ from .schemas import (
     ProofIntrospectResponse,
     TemplateCreateRequest,
     TemplateCreateResponse,
+    TemplateInfo,
+    TemplateListResponse,
+    TemplateRevokeResponse,
     VerifyLivenessRequest,
     VerifyLivenessResponse,
     VerificationSessionCreateRequest,
@@ -84,6 +88,13 @@ class VerificationEvaluation:
     message: str
 
 
+@dataclass
+class ImageQualitySummary:
+    passed: bool
+    score: float
+    detail: str
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(static_dir / "index.html")
@@ -117,12 +128,16 @@ def ready() -> dict:
 
 
 @app.post("/api/enroll", response_model=EnrollResponse)
-async def enroll_face(file: UploadFile = File(...)) -> EnrollResponse:
-    raw = await file.read()
+def enroll_face(file: UploadFile = File(...)) -> EnrollResponse:
+    raw = file.file.read()
     try:
         bgr = decode_image_bytes(raw, settings.max_upload_bytes)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    image_quality = _validate_sampled_image_quality([bgr], settings, "基准图像质量")
+    if not image_quality["passed"]:
+        raise HTTPException(status_code=400, detail=f"基准图片质量不达标：{image_quality['detail']}")
 
     faces = face_engine.extract_faces(bgr)
     if not faces:
@@ -131,6 +146,26 @@ async def enroll_face(file: UploadFile = File(...)) -> EnrollResponse:
         raise HTTPException(status_code=400, detail="上传图片检测到多张人脸，请只上传本人清晰正脸")
 
     face = faces[0]
+    face_quality = _validate_face_bbox_quality(
+        face.bbox,
+        bgr.shape,
+        settings.image_quality_template_min_face_ratio,
+        settings,
+        "基准人脸画面",
+    )
+    if not face_quality["passed"]:
+        raise HTTPException(status_code=400, detail=f"基准人脸画面不达标：{face_quality['detail']}")
+
+    pose_quality = _validate_pose_quality(
+        [bgr],
+        settings,
+        "基准姿态质量",
+        settings.image_quality_template_max_abs_yaw,
+        settings.image_quality_template_max_abs_pitch,
+    )
+    if not pose_quality["passed"]:
+        raise HTTPException(status_code=400, detail=f"基准人脸姿态不达标：{pose_quality['detail']}")
+
     enrollment = store.create_enrollment(face.embedding, face.bbox)
     return EnrollResponse(
         enrollment_id=enrollment.id,
@@ -253,6 +288,10 @@ def create_template(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    image_quality = _validate_sampled_image_quality([bgr], settings, "基准图像质量")
+    if not image_quality["passed"]:
+        raise HTTPException(status_code=400, detail=f"基准图片质量不达标：{image_quality['detail']}")
+
     faces = face_engine.extract_faces(bgr)
     if not faces:
         raise HTTPException(status_code=400, detail="基准图片未检测到人脸")
@@ -260,6 +299,26 @@ def create_template(
         raise HTTPException(status_code=400, detail="基准图片检测到多张人脸，请只登记本人清晰正脸")
 
     face = faces[0]
+    face_quality = _validate_face_bbox_quality(
+        face.bbox,
+        bgr.shape,
+        settings.image_quality_template_min_face_ratio,
+        settings,
+        "基准人脸画面",
+    )
+    if not face_quality["passed"]:
+        raise HTTPException(status_code=400, detail=f"基准人脸画面不达标：{face_quality['detail']}")
+
+    pose_quality = _validate_pose_quality(
+        [bgr],
+        settings,
+        "基准姿态质量",
+        settings.image_quality_template_max_abs_yaw,
+        settings.image_quality_template_max_abs_pitch,
+    )
+    if not pose_quality["passed"]:
+        raise HTTPException(status_code=400, detail=f"基准人脸姿态不达标：{pose_quality['detail']}")
+
     source_hash = hashlib.sha256(payload.image.encode("utf-8")).hexdigest()
     template = store.create_template(
         subject_type=payload.subject_type,
@@ -277,6 +336,40 @@ def create_template(
         status=template.status,
         bbox=template.bbox,
         message="新版基准人脸模板已生效",
+    )
+
+
+@app.get(
+    "/v1/internal/templates/subjects/{subject_type}/{subject_id}",
+    response_model=TemplateListResponse,
+)
+def list_subject_templates(
+    subject_type: str,
+    subject_id: str,
+    _authorized: bool = Depends(_require_internal_api_key),
+) -> TemplateListResponse:
+    templates = store.list_templates(subject_type, subject_id)
+    active = next((item for item in templates if item.status == "active"), None)
+    return TemplateListResponse(
+        subject_type=subject_type,
+        subject_id=subject_id,
+        active_template_id=active.template_id if active else None,
+        templates=[_template_info(item) for item in templates],
+    )
+
+
+@app.post("/v1/internal/templates/{template_id}/revoke", response_model=TemplateRevokeResponse)
+def revoke_template(
+    template_id: str,
+    _authorized: bool = Depends(_require_internal_api_key),
+) -> TemplateRevokeResponse:
+    template = store.revoke_template(template_id)
+    if template is None:
+        raise HTTPException(status_code=404, detail="人脸模板不存在")
+    return TemplateRevokeResponse(
+        template_id=template.template_id,
+        revoked=template.status == "revoked",
+        status=template.status,
     )
 
 
@@ -321,6 +414,10 @@ def verify_verification_session(
     payload: VerificationSessionVerifyRequest,
     authorization: Optional[str] = Header(default=None),
 ) -> VerificationSessionVerifyResponse:
+    store.recover_stale_session_verification(
+        session_id,
+        settings.verification_processing_timeout_seconds,
+    )
     session = store.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="核验会话不存在")
@@ -339,7 +436,8 @@ def verify_verification_session(
         store.mark_session_failed(session_id, "FAIL_TEMPLATE_INVALID")
         raise HTTPException(status_code=409, detail="人脸模板无效，请重新登记")
 
-    if not store.start_session_verification(session_id):
+    verification_attempt = store.start_session_verification(session_id)
+    if not verification_attempt:
         raise HTTPException(status_code=409, detail="核验会话已使用，请重新发起")
 
     try:
@@ -352,12 +450,12 @@ def verify_verification_session(
     except HTTPException as exc:
         result_code = _result_code_from_exception(exc)
         if result_code == "ERROR_MODEL_UNAVAILABLE":
-            store.reset_session_verification(session_id)
+            store.reset_session_verification(session_id, verification_attempt)
         else:
-            store.mark_session_failed(session_id, result_code)
+            store.mark_session_failed(session_id, result_code, verification_attempt)
         raise
     except Exception as exc:
-        store.mark_session_failed(session_id, "ERROR_INTERNAL")
+        store.mark_session_failed(session_id, "ERROR_INTERNAL", verification_attempt)
         raise HTTPException(status_code=500, detail="核验处理失败，请稍后重试") from exc
 
     proof_id = None
@@ -366,12 +464,19 @@ def verify_verification_session(
             session_id=session_id,
             result_code="PASS",
             ttl_seconds=settings.proof_ttl_seconds,
+            verifying_started_at=verification_attempt,
+            action_results=evaluation.action_results,
         )
         if proof is None:
-            raise HTTPException(status_code=500, detail="核验凭证签发失败")
+            raise HTTPException(status_code=409, detail="核验会话已超时，请重新提交")
         proof_id = proof.proof_id
     else:
-        store.mark_session_failed(session_id, evaluation.result_code)
+        store.mark_session_failed(
+            session_id,
+            evaluation.result_code,
+            verification_attempt,
+            action_results=evaluation.action_results,
+        )
 
     return VerificationSessionVerifyResponse(
         session_id=session_id,
@@ -433,6 +538,22 @@ def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
     return token or None
 
 
+def _template_info(template) -> TemplateInfo:
+    return TemplateInfo(
+        template_id=template.template_id,
+        template_version=template.template_version,
+        subject_type=template.subject_type,
+        subject_id=template.subject_id,
+        status=template.status,
+        source_type=template.source_type,
+        source_image_hash=template.source_image_hash,
+        bbox=template.bbox,
+        created_at=template.created_at,
+        activated_at=template.activated_at,
+        revoked_at=template.revoked_at,
+    )
+
+
 def _proof_response(proof) -> ProofIntrospectResponse:
     return ProofIntrospectResponse(
         valid=proof.valid,
@@ -486,17 +607,85 @@ def _evaluate_liveness_frames(
     if not all_frames:
         raise HTTPException(status_code=400, detail="没有收到有效动作帧")
 
+    action_results = []
+    image_quality = _validate_sampled_image_quality(all_frames, settings, "图像质量")
+    action_results.append(image_quality)
+    if not image_quality["passed"]:
+        return VerificationEvaluation(
+            passed=False,
+            result_code="FAIL_FACE_QUALITY",
+            anti_spoofing_passed=False,
+            anti_spoofing_score=0.0,
+            face_matched=False,
+            similarity=None,
+            threshold=settings.face_match_threshold,
+            action_results=action_results,
+            live_embedding=None,
+            message="摄像头画面质量不达标",
+        )
+
     frame_uniqueness = _validate_frame_uniqueness(all_frames, settings)
+    action_results.append(frame_uniqueness)
+    if not frame_uniqueness["passed"]:
+        return VerificationEvaluation(
+            passed=False,
+            result_code="FAIL_DUPLICATE_FRAMES",
+            anti_spoofing_passed=False,
+            anti_spoofing_score=0.0,
+            face_matched=False,
+            similarity=None,
+            threshold=settings.face_match_threshold,
+            action_results=action_results,
+            live_embedding=None,
+            message="摄像头帧重复度过高",
+        )
+
+    liveness_action_results = verify_liveness_actions(frames_by_action, expected_actions, settings)
+    action_passed = all(item["passed"] for item in liveness_action_results)
+    action_results.extend(liveness_action_results)
+    if not action_passed:
+        return VerificationEvaluation(
+            passed=False,
+            result_code="FAIL_ACTION",
+            anti_spoofing_passed=False,
+            anti_spoofing_score=0.0,
+            face_matched=False,
+            similarity=None,
+            threshold=settings.face_match_threshold,
+            action_results=action_results,
+            live_embedding=None,
+            message="动作检测失败",
+        )
+
     deep_check_frames = _select_deep_check_frames(frames_by_action, expected_actions, settings)
+    pose_check_frames = _select_pose_quality_frames(frames_by_action, expected_actions, settings)
+    pose_quality = _validate_pose_quality(
+        pose_check_frames,
+        settings,
+        "姿态质量",
+        settings.image_quality_live_max_abs_yaw,
+        settings.image_quality_live_max_abs_pitch,
+    )
+    action_results.append(pose_quality)
+    if not pose_quality["passed"]:
+        return VerificationEvaluation(
+            passed=False,
+            result_code="FAIL_FACE_QUALITY",
+            anti_spoofing_passed=False,
+            anti_spoofing_score=0.0,
+            face_matched=False,
+            similarity=None,
+            threshold=settings.face_match_threshold,
+            action_results=action_results,
+            live_embedding=None,
+            message="摄像头人脸姿态不达标",
+        )
+
     live_face_check = _analyze_live_faces(
         deep_check_frames,
         settings,
         sample_count=len(deep_check_frames),
     )
-
-    action_results = verify_liveness_actions(frames_by_action, expected_actions, settings)
-    action_passed = all(item["passed"] for item in action_results)
-    action_results.append(frame_uniqueness)
     action_results.append(
         {
             "action": "face_consistency",
@@ -520,6 +709,26 @@ def _evaluate_liveness_frames(
             action_results=action_results,
             live_embedding=None,
             message=live_face_check.detail or "摄像头画面未检测到人脸",
+        )
+
+    face_bbox_quality = _validate_live_face_bbox_quality(
+        deep_check_frames,
+        live_face_check.bboxes,
+        settings,
+    )
+    action_results.append(face_bbox_quality)
+    if not face_bbox_quality["passed"]:
+        return VerificationEvaluation(
+            passed=False,
+            result_code="FAIL_FACE_QUALITY",
+            anti_spoofing_passed=False,
+            anti_spoofing_score=0.0,
+            face_matched=False,
+            similarity=None,
+            threshold=settings.face_match_threshold,
+            action_results=action_results,
+            live_embedding=None,
+            message="摄像头人脸画面质量不达标",
         )
 
     try:
@@ -562,9 +771,8 @@ def _evaluate_liveness_frames(
     )
 
     liveness_passed = (
-        action_passed
-        and frame_uniqueness["passed"]
-        and live_face_check.passed
+        live_face_check.passed
+        and face_bbox_quality["passed"]
         and spoof_result.passed
         and face_match["passed"]
     )
@@ -572,15 +780,12 @@ def _evaluate_liveness_frames(
     if liveness_passed:
         result_code = "PASS"
         message = "活体检测通过，且为本人"
-    elif not action_passed:
-        result_code = "FAIL_ACTION"
-        message = "动作检测失败"
-    elif not frame_uniqueness["passed"]:
-        result_code = "FAIL_DUPLICATE_FRAMES"
-        message = "摄像头帧重复度过高"
     elif not live_face_check.passed:
         result_code = "FAIL_FACE_INCONSISTENT"
         message = "人脸稳定性检测失败"
+    elif not face_bbox_quality["passed"]:
+        result_code = "FAIL_FACE_QUALITY"
+        message = "摄像头人脸画面质量不达标"
     elif not spoof_result.passed:
         result_code = "FAIL_PAD"
         message = "防翻拍检测失败"
@@ -698,6 +903,215 @@ def _validate_frame_uniqueness(frames: list, settings: Settings) -> dict:
     }
 
 
+def _validate_sampled_image_quality(frames: list, settings: Settings, label: str) -> dict:
+    if not frames:
+        return {
+            "action": "image_quality",
+            "label": label,
+            "passed": False,
+            "score": 0.0,
+            "detail": "没有可检测的图像",
+        }
+
+    indexes = _evenly_spaced_indexes(
+        len(frames),
+        min(settings.image_quality_sample_frames, len(frames)),
+    )
+    summaries = [_measure_image_quality(frames[index], settings) for index in indexes]
+    passed_items = [item for item in summaries if item.passed]
+    pass_ratio = len(passed_items) / max(len(summaries), 1)
+    passed = pass_ratio >= 0.67
+    laplacians = [item.score for item in summaries]
+    brightness_values = [_gray_mean(frames[index]) for index in indexes]
+    contrast_values = [_gray_std(frames[index]) for index in indexes]
+    return {
+        "action": "image_quality",
+        "label": label,
+        "passed": passed,
+        "score": round(pass_ratio, 4),
+        "detail": (
+            f"pass_ratio={pass_ratio:.0%}, "
+            f"laplacian_median={float(np.median(laplacians)):.1f}, "
+            f"brightness_median={float(np.median(brightness_values)):.1f}, "
+            f"contrast_median={float(np.median(contrast_values)):.1f}, "
+            f"frames={len(summaries)}"
+        ),
+    }
+
+
+def _measure_image_quality(frame: np.ndarray, settings: Settings) -> ImageQualitySummary:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    brightness = float(np.mean(gray))
+    contrast = float(np.std(gray))
+    laplacian = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    passed = (
+        laplacian >= settings.image_quality_min_laplacian
+        and settings.image_quality_min_brightness <= brightness <= settings.image_quality_max_brightness
+        and contrast >= settings.image_quality_min_contrast
+    )
+    return ImageQualitySummary(
+        passed=passed,
+        score=laplacian,
+        detail=(
+            f"laplacian={laplacian:.1f}, brightness={brightness:.1f}, "
+            f"contrast={contrast:.1f}"
+        ),
+    )
+
+
+def _gray_mean(frame: np.ndarray) -> float:
+    return float(np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
+
+
+def _gray_std(frame: np.ndarray) -> float:
+    return float(np.std(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
+
+
+def _validate_face_bbox_quality(
+    bbox: list,
+    frame_shape: tuple,
+    min_face_ratio: float,
+    settings: Settings,
+    label: str,
+) -> dict:
+    height, width = frame_shape[:2]
+    x1, y1, x2, y2 = [float(value) for value in bbox]
+    box_w = max(0.0, x2 - x1)
+    box_h = max(0.0, y2 - y1)
+    box_area = box_w * box_h
+    image_area = max(float(width * height), 1.0)
+    area_ratio = box_area / image_area
+    clipped_x1 = min(max(x1, 0.0), float(width))
+    clipped_y1 = min(max(y1, 0.0), float(height))
+    clipped_x2 = min(max(x2, 0.0), float(width))
+    clipped_y2 = min(max(y2, 0.0), float(height))
+    clipped_area = max(0.0, clipped_x2 - clipped_x1) * max(0.0, clipped_y2 - clipped_y1)
+    visible_ratio = clipped_area / max(box_area, 1.0)
+    passed = (
+        min_face_ratio <= area_ratio <= settings.image_quality_max_face_ratio
+        and visible_ratio >= 0.90
+    )
+    return {
+        "action": "face_bbox_quality",
+        "label": label,
+        "passed": passed,
+        "score": round(area_ratio, 4),
+        "detail": (
+            f"face_area={area_ratio:.1%}, visible={visible_ratio:.0%}, "
+            f"min={min_face_ratio:.1%}, max={settings.image_quality_max_face_ratio:.0%}"
+        ),
+    }
+
+
+def _validate_pose_quality(
+    frames: list,
+    settings: Settings,
+    label: str,
+    max_abs_yaw: float,
+    max_abs_pitch: float,
+) -> dict:
+    if not frames:
+        return {
+            "action": "pose_quality",
+            "label": label,
+            "passed": False,
+            "score": 0.0,
+            "detail": "没有可检测的姿态帧",
+        }
+    indexes = _evenly_spaced_indexes(
+        len(frames),
+        min(settings.image_quality_sample_frames, len(frames)),
+    )
+    metrics = []
+    with mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=len(frames) == 1,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    ) as face_mesh:
+        for index in indexes:
+            item = _extract_metrics(frames[index], face_mesh)
+            if item is not None:
+                metrics.append(item)
+    if not metrics:
+        return {
+            "action": "pose_quality",
+            "label": label,
+            "passed": False,
+            "score": 0.0,
+            "detail": "未检测到可用于姿态判断的人脸关键点",
+        }
+    passed_items = [
+        item for item in metrics
+        if _fold_abs_pose_angle(item.yaw) <= max_abs_yaw
+        and _fold_abs_pose_angle(item.pitch) <= max_abs_pitch
+    ]
+    pass_ratio = len(passed_items) / max(len(metrics), 1)
+    yaw_values = [_fold_abs_pose_angle(item.yaw) for item in metrics]
+    pitch_values = [_fold_abs_pose_angle(item.pitch) for item in metrics]
+    passed = pass_ratio >= 0.67
+    return {
+        "action": "pose_quality",
+        "label": label,
+        "passed": passed,
+        "score": round(pass_ratio, 4),
+        "detail": (
+            f"pass_ratio={pass_ratio:.0%}, "
+            f"yaw_max={max(yaw_values):.1f}/{max_abs_yaw:.1f}, "
+            f"pitch_max={max(pitch_values):.1f}/{max_abs_pitch:.1f}, "
+            f"frames={len(metrics)}/{len(indexes)}"
+        ),
+    }
+
+
+def _fold_abs_pose_angle(value: float) -> float:
+    angle = abs(float(value)) % 360.0
+    if angle > 180.0:
+        angle = 360.0 - angle
+    if angle > 90.0:
+        angle = 180.0 - angle
+    return abs(angle)
+
+
+def _validate_live_face_bbox_quality(frames: list, bboxes: list, settings: Settings) -> dict:
+    checks = []
+    for frame, bbox in zip(frames, bboxes):
+        if bbox is None:
+            continue
+        checks.append(
+            _validate_face_bbox_quality(
+                bbox,
+                frame.shape,
+                settings.image_quality_live_min_face_ratio,
+                settings,
+                "人脸画面质量",
+            )
+        )
+    if not checks:
+        return {
+            "action": "face_bbox_quality",
+            "label": "人脸画面质量",
+            "passed": False,
+            "score": 0.0,
+            "detail": "没有可检测的人脸框",
+        }
+    pass_ratio = sum(1 for item in checks if item["passed"]) / len(checks)
+    area_values = [item["score"] for item in checks]
+    passed = pass_ratio >= 0.67
+    return {
+        "action": "face_bbox_quality",
+        "label": "人脸画面质量",
+        "passed": passed,
+        "score": round(pass_ratio, 4),
+        "detail": (
+            f"pass_ratio={pass_ratio:.0%}, "
+            f"face_area_median={float(np.median(area_values)):.1%}, "
+            f"frames={len(checks)}"
+        ),
+    }
+
+
 def _frame_hash(frame: np.ndarray, hash_size: int) -> tuple:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     resized = cv2.resize(gray, (hash_size, hash_size), interpolation=cv2.INTER_AREA)
@@ -752,8 +1166,55 @@ def _select_deep_check_frames(
     selected = []
     for action in expected_actions:
         frames = frames_by_action.get(action, [])
-        selected.extend(frames[index] for index in _evenly_spaced_indexes(len(frames), per_action))
+        indexes = _select_action_deep_check_indexes(action, len(frames), per_action)
+        selected.extend(frames[index] for index in indexes)
     return selected
+
+
+def _select_pose_quality_frames(
+    frames_by_action: dict,
+    expected_actions: list,
+    settings: Settings,
+) -> list:
+    stable_actions = [
+        action
+        for action in expected_actions
+        if action not in {"shake_head", "nod_head"}
+    ]
+    if not stable_actions:
+        stable_actions = [
+            action
+            for action in expected_actions
+            if action != "shake_head"
+        ]
+    if stable_actions:
+        return _select_deep_check_frames(frames_by_action, stable_actions, settings)
+    return _select_deep_check_frames(frames_by_action, expected_actions, settings)
+
+
+def _select_action_deep_check_indexes(action: str, total: int, count: int) -> list:
+    if total <= 0:
+        return []
+    if total <= count:
+        return list(range(total))
+
+    if action == "blink":
+        edge_count = max(1, total // 4)
+        candidates = list(range(edge_count)) + list(range(total - edge_count, total))
+    else:
+        margin = max(0, total // 4)
+        candidates = list(range(margin, total - margin)) or list(range(total))
+
+    if len(candidates) < count:
+        candidates = list(range(total))
+    return [candidates[index] for index in _evenly_spaced_indexes(len(candidates), count)]
+
+
+def _extract_live_faces(frame: np.ndarray, settings: Settings) -> list:
+    try:
+        return face_engine.extract_faces(frame, det_size=settings.insightface_live_det_size)
+    except TypeError:
+        return face_engine.extract_faces(frame)
 
 
 def _analyze_live_faces(
@@ -771,7 +1232,7 @@ def _analyze_live_faces(
     for index, frame in enumerate(frames):
         if index not in sample_set:
             continue
-        frame_faces = face_engine.extract_faces(frame)
+        frame_faces = _extract_live_faces(frame, settings)
         if not frame_faces:
             continue
         if len(frame_faces) > 1:

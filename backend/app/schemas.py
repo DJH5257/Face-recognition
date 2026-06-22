@@ -4,6 +4,9 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
+MAX_VERIFY_FRAMES = 90
+
+
 class EnrollResponse(BaseModel):
     enrollment_id: str
     bbox: List[float]
@@ -40,7 +43,7 @@ class VerifyLivenessRequest(BaseModel):
 
     challenge_id: str
     enrollment_id: Optional[str] = None
-    frames: List[FramePayload] = Field(..., min_length=1, max_length=72)
+    frames: List[FramePayload] = Field(..., min_length=1, max_length=MAX_VERIFY_FRAMES)
 
 
 class ActionResult(BaseModel):
@@ -102,6 +105,33 @@ class TemplateCreateResponse(BaseModel):
     message: str
 
 
+class TemplateInfo(BaseModel):
+    template_id: str
+    template_version: int
+    subject_type: str
+    subject_id: str
+    status: str
+    source_type: str
+    source_image_hash: Optional[str] = None
+    bbox: List[float]
+    created_at: datetime
+    activated_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+
+
+class TemplateListResponse(BaseModel):
+    subject_type: str
+    subject_id: str
+    active_template_id: Optional[str] = None
+    templates: List[TemplateInfo]
+
+
+class TemplateRevokeResponse(BaseModel):
+    template_id: str
+    revoked: bool
+    status: str
+
+
 class VerificationSessionCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -126,7 +156,7 @@ class VerificationSessionCreateResponse(BaseModel):
 class VerificationSessionVerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    frames: List[FramePayload] = Field(..., min_length=1, max_length=72)
+    frames: List[FramePayload] = Field(..., min_length=1, max_length=MAX_VERIFY_FRAMES)
 
 
 class VerificationSessionVerifyResponse(BaseModel):

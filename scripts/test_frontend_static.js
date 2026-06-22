@@ -101,11 +101,17 @@ vm.createContext(context);
 vm.runInContext(appJs, context);
 
 const constants = vm.runInContext(
-  "({ CAPTURE_DURATION_MS, CAPTURE_INTERVAL_MS, CAPTURE_WIDTH, CAPTURE_JPEG_QUALITY, ACTION_SWITCH_PAUSE_MS })",
+  "({ CAPTURE_DURATION_MS, CAPTURE_INTERVAL_MS, ACTION_CAPTURE_INTERVAL_MS, CAPTURE_WIDTH, CAPTURE_JPEG_QUALITY, ACTION_SWITCH_PAUSE_MS })",
   context,
 );
 assert(constants.CAPTURE_DURATION_MS === 2000, "capture duration must remain 2 seconds");
-assert(constants.CAPTURE_INTERVAL_MS === 200, "capture interval must remain 200ms");
+assert(constants.CAPTURE_INTERVAL_MS === 200, "default capture interval must remain 200ms");
+assert(constants.ACTION_CAPTURE_INTERVAL_MS.blink === 80, "blink capture interval must be 80ms");
+assert(constants.ACTION_CAPTURE_INTERVAL_MS.mouth_open === 120, "mouth capture interval must be 120ms");
+assert(
+  vm.runInContext("captureIntervalForAction('shake_head')", context) === 200,
+  "head movement actions should keep the low-load 200ms capture interval",
+);
 assert(constants.CAPTURE_WIDTH === 360, "capture width must stay low-end friendly");
 assert(constants.CAPTURE_JPEG_QUALITY === 0.7, "JPEG quality must control payload size");
 assert(constants.ACTION_SWITCH_PAUSE_MS === 250, "action switch pause should stay short");
@@ -121,7 +127,7 @@ assert(
 assert(!formatted.includes("[object Object]"), "validation errors must be readable");
 
 const frameCountExpressionPresent = appJs.includes(
-  "Math.floor(CAPTURE_DURATION_MS / CAPTURE_INTERVAL_MS) + 1",
+  "Math.ceil(CAPTURE_DURATION_MS / intervalMs) + 1",
 );
 assert(frameCountExpressionPresent, "capture must include final frame covering the full 2 seconds");
 

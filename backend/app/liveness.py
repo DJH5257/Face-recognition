@@ -49,7 +49,7 @@ def verify_liveness_actions(
     with mp.solutions.face_mesh.FaceMesh(
         static_image_mode=False,
         max_num_faces=1,
-        refine_landmarks=False,
+        refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     ) as face_mesh:
@@ -85,16 +85,7 @@ def _judge_action(action: str, metrics: List[FrameMetrics], settings: Settings) 
     pitches = np.array([m.pitch for m in metrics], dtype=np.float32)
 
     if action == "blink":
-        min_ear = float(np.min(ears))
-        max_ear = float(np.max(ears))
-        passed = min_ear < settings.blink_ear_threshold and max_ear > settings.blink_ear_threshold + 0.03
-        score = max(0.0, settings.blink_ear_threshold - min_ear) + max(0.0, max_ear - settings.blink_ear_threshold)
-        return {
-            "action": action,
-            "passed": passed,
-            "score": round(float(score), 4),
-            "detail": f"EAR min={min_ear:.3f}, max={max_ear:.3f}",
-        }
+        return _judge_blink_action(action, ears, settings)
 
     if action == "mouth_open":
         min_mar = float(np.min(mars))
@@ -133,15 +124,80 @@ def _judge_action(action: str, metrics: List[FrameMetrics], settings: Settings) 
 
     if action == "smile":
         smile_delta = float(np.max(smiles) - np.min(smiles))
-        passed = smile_delta > settings.smile_delta_threshold
+        mar_delta = float(np.max(mars) - np.min(mars))
+        assisted_threshold = settings.smile_delta_threshold * 0.93
+        passed = smile_delta > settings.smile_delta_threshold or (
+            smile_delta >= assisted_threshold and mar_delta >= 0.018
+        )
         return {
             "action": action,
             "passed": passed,
             "score": round(smile_delta, 4),
-            "detail": f"mouth width ratio delta={smile_delta:.3f}",
+            "detail": (
+                f"mouth width ratio delta={smile_delta:.3f}, "
+                f"MAR delta={mar_delta:.3f}"
+            ),
         }
 
     return {"action": action, "passed": False, "score": 0.0, "detail": "未知动作"}
+
+
+def _judge_blink_action(action: str, ears: np.ndarray, settings: Settings) -> dict:
+    smoothed = _smooth_series(ears)
+    edge_count = max(1, int(np.ceil(len(smoothed) * 0.2)))
+    edge_values = np.concatenate([smoothed[:edge_count], smoothed[-edge_count:]])
+    baseline = float(np.median(edge_values))
+    trough_index = int(np.argmin(smoothed))
+    trough = float(smoothed[trough_index])
+    drop = baseline - trough
+    drop_threshold = max(0.036, baseline * 0.145)
+    baseline_threshold = settings.blink_ear_threshold * 0.9
+    relaxed_baseline_threshold = max(0.12, settings.blink_ear_threshold * 0.6)
+
+    before_peak = float(np.max(smoothed[:trough_index])) if trough_index > 0 else 0.0
+    after_peak = float(np.max(smoothed[trough_index + 1:])) if trough_index + 1 < len(smoothed) else 0.0
+    closed_threshold = baseline - drop_threshold * 0.55
+    closed_ratio = float(np.mean(smoothed <= closed_threshold))
+    recovery_ok = after_peak >= baseline * 0.76
+    endpoint_close_ok = (
+        trough_index >= len(smoothed) - max(2, int(np.ceil(len(smoothed) * 0.2)))
+        and drop >= drop_threshold * 1.2
+        and before_peak >= baseline * 0.85
+        and closed_ratio <= 0.60
+    )
+    baseline_ok = baseline >= baseline_threshold or (
+        baseline >= relaxed_baseline_threshold
+        and drop >= drop_threshold
+        and before_peak >= baseline * 0.85
+        and (recovery_ok or endpoint_close_ok)
+    )
+    passed = (
+        baseline_ok
+        and drop >= drop_threshold
+        and before_peak >= baseline * 0.85
+        and (recovery_ok or endpoint_close_ok)
+        and 0 < trough_index
+        and closed_ratio <= 0.70
+    )
+    return {
+        "action": action,
+        "passed": bool(passed),
+        "score": round(float(max(drop, 0.0)), 4),
+        "detail": (
+            f"EAR baseline={baseline:.3f}, trough={trough:.3f}, "
+            f"drop={drop:.3f}/{drop_threshold:.3f}, "
+            f"baseline_min={relaxed_baseline_threshold:.3f}, "
+            f"recovery={after_peak:.3f}, closed_ratio={closed_ratio:.0%}"
+        ),
+    }
+
+
+def _smooth_series(values: np.ndarray) -> np.ndarray:
+    if len(values) < 3:
+        return values.astype(np.float32)
+    padded = np.pad(values.astype(np.float32), (1, 1), mode="edge")
+    kernel = np.array([0.25, 0.5, 0.25], dtype=np.float32)
+    return np.convolve(padded, kernel, mode="valid").astype(np.float32)
 
 
 def _extract_metrics(bgr: np.ndarray, face_mesh) -> Optional[FrameMetrics]:

@@ -10,13 +10,18 @@ from pydantic import ValidationError
 from backend.app.config import Settings
 from backend.app.face_engine import decode_base64_image
 from backend.app import main
-from backend.app.liveness import ACTION_LABELS, random_actions
+from backend.app.liveness import ACTION_LABELS, FrameMetrics, _judge_action, _judge_blink_action, random_actions
 from backend.app.main import (
     _analyze_live_faces,
+    _fold_abs_pose_angle,
     _match_live_face,
+    _validate_face_bbox_quality,
     _select_deep_check_frames,
+    _select_pose_quality_frames,
+    _validate_pose_quality,
     _validate_frame_sequence,
     _validate_frame_uniqueness,
+    _validate_sampled_image_quality,
 )
 from backend.app.schemas import ChallengeRequest, CompareRequest, FramePayload, VerifyLivenessRequest
 from backend.app.schemas import (
@@ -74,6 +79,14 @@ class VerificationGuardTests(unittest.TestCase):
 
         _validate_frame_sequence(frames, ["blink"], self.settings)
 
+    def test_valid_frame_sequence_allows_high_rate_blink_capture(self):
+        frames = [
+            make_frame("blink", index, index * 80)
+            for index in range(26)
+        ]
+
+        _validate_frame_sequence(frames, ["blink"], self.settings)
+
     def test_frame_sequence_rejects_short_capture(self):
         frames = [
             make_frame("blink", index, index * 80)
@@ -122,6 +135,65 @@ class VerificationGuardTests(unittest.TestCase):
         result = _validate_frame_uniqueness(frames, self.settings)
 
         self.assertTrue(result["passed"])
+
+    def test_image_quality_rejects_flat_dark_frames(self):
+        frames = [np.zeros((64, 64, 3), dtype=np.uint8) for _ in range(6)]
+
+        result = _validate_sampled_image_quality(frames, self.settings, "图像质量")
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["action"], "image_quality")
+
+    def test_image_quality_accepts_textured_normal_frames(self):
+        frames = [_textured_frame(96, 96) for _ in range(6)]
+
+        result = _validate_sampled_image_quality(frames, self.settings, "图像质量")
+
+        self.assertTrue(result["passed"], result["detail"])
+
+    def test_face_bbox_quality_rejects_tiny_face(self):
+        result = _validate_face_bbox_quality(
+            [1, 1, 5, 5],
+            (200, 200, 3),
+            self.settings.image_quality_template_min_face_ratio,
+            self.settings,
+            "基准人脸画面",
+        )
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["action"], "face_bbox_quality")
+
+    def test_pose_quality_rejects_frames_without_landmarks(self):
+        frames = [np.zeros((64, 64, 3), dtype=np.uint8)]
+        original_face_mesh = main.mp.solutions.face_mesh.FaceMesh
+        original_extract_metrics = main._extract_metrics
+
+        class DummyFaceMesh:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        main.mp.solutions.face_mesh.FaceMesh = DummyFaceMesh
+        main._extract_metrics = lambda *_args, **_kwargs: None
+
+        try:
+            result = _validate_pose_quality(frames, self.settings, "姿态质量", 55.0, 55.0)
+        finally:
+            main.mp.solutions.face_mesh.FaceMesh = original_face_mesh
+            main._extract_metrics = original_extract_metrics
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["action"], "pose_quality")
+
+    def test_pose_angle_fold_handles_rotation_ambiguity(self):
+        self.assertAlmostEqual(_fold_abs_pose_angle(179.5), 0.5)
+        self.assertAlmostEqual(_fold_abs_pose_angle(-179.0), 1.0)
+        self.assertAlmostEqual(_fold_abs_pose_angle(35.0), 35.0)
 
     def test_decode_base64_image_rejects_invalid_payload(self):
         with self.assertRaises(ValueError):
@@ -198,6 +270,33 @@ class VerificationGuardTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             ProofFinalizeRequest(business_event_id="event", threshold=0.01)
 
+    def test_verify_request_models_allow_configured_frame_ceiling(self):
+        frames = [
+            FramePayload(
+                action="blink",
+                index=index,
+                timestamp=index * 80,
+                image="data:image/jpeg;base64,AAAA",
+            )
+            for index in range(90)
+        ]
+
+        VerifyLivenessRequest(challenge_id="challenge", frames=frames)
+        VerificationSessionVerifyRequest(frames=frames)
+
+        too_many = frames + [
+            FramePayload(
+                action="blink",
+                index=90,
+                timestamp=7200,
+                image="data:image/jpeg;base64,AAAA",
+            )
+        ]
+        with self.assertRaises(ValidationError):
+            VerifyLivenessRequest(challenge_id="challenge", frames=too_many)
+        with self.assertRaises(ValidationError):
+            VerificationSessionVerifyRequest(frames=too_many)
+
     def test_random_actions_use_default_one_to_three_unique_actions(self):
         action_names = set(ACTION_LABELS)
         for _ in range(100):
@@ -246,6 +345,92 @@ class VerificationGuardTests(unittest.TestCase):
         selected_values = [int(frame[0, 0, 0]) for frame in selected]
         for action_index in range(len(actions)):
             self.assertTrue(any(action_index * 50 <= value < action_index * 50 + 11 for value in selected_values))
+        blink_values = [value for value in selected_values if value < 11]
+        self.assertTrue(all(value <= 2 or value >= 8 for value in blink_values))
+
+    def test_pose_quality_frames_skip_head_motion_when_stable_actions_exist(self):
+        settings = Settings(face_match_embedding_sample=6, anti_spoofing_sample_frames=6)
+        actions = ["shake_head", "blink", "nod_head"]
+        frames_by_action = {
+            action: [
+                np.full((8, 8, 3), action_index * 50 + frame_index, dtype=np.uint8)
+                for frame_index in range(11)
+            ]
+            for action_index, action in enumerate(actions)
+        }
+
+        selected = _select_pose_quality_frames(frames_by_action, actions, settings)
+
+        self.assertTrue(selected)
+        selected_values = [int(frame[0, 0, 0]) for frame in selected]
+        self.assertTrue(all(50 <= value < 61 for value in selected_values))
+
+    def test_blink_event_detects_relative_close_and_recovery(self):
+        ears = np.array(
+            [0.27, 0.27, 0.268, 0.265, 0.24, 0.18, 0.145, 0.18, 0.235, 0.265, 0.27, 0.27],
+            dtype=np.float32,
+        )
+
+        result = _judge_blink_action("blink", ears, self.settings)
+
+        self.assertTrue(result["passed"], result["detail"])
+        self.assertIn("baseline", result["detail"])
+
+    def test_blink_event_rejects_static_eye_series(self):
+        ears = np.full((12,), 0.27, dtype=np.float32)
+
+        result = _judge_blink_action("blink", ears, self.settings)
+
+        self.assertFalse(result["passed"])
+
+    def test_blink_event_accepts_five_percent_relaxed_drop(self):
+        ears = np.array(
+            [0.24, 0.24, 0.24, 0.24, 0.201, 0.201, 0.201, 0.24, 0.24, 0.24, 0.24, 0.24],
+            dtype=np.float32,
+        )
+
+        result = _judge_blink_action("blink", ears, self.settings)
+
+        self.assertTrue(result["passed"], result["detail"])
+
+    def test_blink_event_accepts_low_baseline_with_clear_close_and_recovery(self):
+        ears = np.array(
+            [0.145, 0.145, 0.145, 0.14, 0.095, 0.055, 0.085, 0.135, 0.19, 0.19, 0.19],
+            dtype=np.float32,
+        )
+
+        result = _judge_blink_action("blink", ears, self.settings)
+
+        self.assertTrue(result["passed"], result["detail"])
+        self.assertIn("baseline_min", result["detail"])
+
+    def test_blink_event_accepts_clear_close_at_capture_end(self):
+        ears = np.array(
+            [0.20, 0.20, 0.198, 0.195, 0.19, 0.18, 0.14, 0.095, 0.055, 0.05, 0.05],
+            dtype=np.float32,
+        )
+
+        result = _judge_blink_action("blink", ears, self.settings)
+
+        self.assertTrue(result["passed"], result["detail"])
+
+    def test_smile_accepts_small_width_change_with_mouth_motion(self):
+        metrics = [
+            FrameMetrics(ear=0.25, mar=0.20, mouth_width_ratio=0.410, yaw=0.0, pitch=0.0),
+            FrameMetrics(ear=0.25, mar=0.21, mouth_width_ratio=0.416, yaw=0.0, pitch=0.0),
+            FrameMetrics(ear=0.25, mar=0.22, mouth_width_ratio=0.422, yaw=0.0, pitch=0.0),
+            FrameMetrics(ear=0.25, mar=0.225, mouth_width_ratio=0.436, yaw=0.0, pitch=0.0),
+            FrameMetrics(ear=0.25, mar=0.223, mouth_width_ratio=0.438, yaw=0.0, pitch=0.0),
+            FrameMetrics(ear=0.25, mar=0.219, mouth_width_ratio=0.437, yaw=0.0, pitch=0.0),
+        ]
+
+        result = _judge_action("smile", metrics, self.settings)
+
+        self.assertTrue(result["passed"], result["detail"])
+        self.assertIn("MAR delta", result["detail"])
+
+    def test_default_nod_threshold_is_relaxed_five_percent(self):
+        self.assertEqual(self.settings.nod_pitch_range_threshold, 10.0)
 
     def test_face_match_requires_threshold_ratio_and_min_similarity(self):
         enrollment = np.array([1.0, 0.0], dtype=np.float32)
@@ -386,6 +571,14 @@ def _normalized(values):
     return arr / max(float(np.linalg.norm(arr)), 1e-12)
 
 
+def _textured_frame(width, height):
+    y, x = np.indices((height, width))
+    base = 120 + ((x * 13 + y * 17) % 80)
+    texture = (((x // 4 + y // 4) % 2) * 45)
+    gray = np.clip(base + texture - 20, 45, 225).astype(np.uint8)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
 def make_verify_request(challenge_id, enrollment_id):
     return VerifyLivenessRequest(
         challenge_id=challenge_id,
@@ -410,6 +603,9 @@ class patched_verification_pipeline:
         self.original_face_check = main._analyze_live_faces
         self.original_actions = main.verify_liveness_actions
         self.original_spoofing = main.anti_spoofing_model
+        self.original_image_quality = main._validate_sampled_image_quality
+        self.original_bbox_quality = main._validate_live_face_bbox_quality
+        self.original_pose_quality = main._validate_pose_quality
 
     def __enter__(self):
         self.decoded_frame_index = 0
@@ -417,6 +613,9 @@ class patched_verification_pipeline:
         main._analyze_live_faces = self._face_check
         main.verify_liveness_actions = self._actions
         main.anti_spoofing_model = FakeAntiSpoofingModel()
+        main._validate_sampled_image_quality = self._quality
+        main._validate_live_face_bbox_quality = self._quality
+        main._validate_pose_quality = self._quality
         return self
 
     def __exit__(self, *_args):
@@ -424,6 +623,9 @@ class patched_verification_pipeline:
         main._analyze_live_faces = self.original_face_check
         main.verify_liveness_actions = self.original_actions
         main.anti_spoofing_model = self.original_spoofing
+        main._validate_sampled_image_quality = self.original_image_quality
+        main._validate_live_face_bbox_quality = self.original_bbox_quality
+        main._validate_pose_quality = self.original_pose_quality
 
     def _face_check(self, frames, _settings, **_kwargs):
         embedding = main._mean_embedding(self.live_embeddings)
@@ -454,6 +656,15 @@ class patched_verification_pipeline:
         value = (self.decoded_frame_index * 20) % 255
         self.decoded_frame_index += 1
         return np.full((32, 32, 3), value, dtype=np.uint8)
+
+    def _quality(self, *_args, **_kwargs):
+        return {
+            "action": "image_quality",
+            "label": "图像质量",
+            "passed": True,
+            "score": 1.0,
+            "detail": "mock quality",
+        }
 
 
 if __name__ == "__main__":

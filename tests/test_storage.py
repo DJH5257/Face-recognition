@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -86,6 +87,182 @@ class ProductionStorageTests(unittest.TestCase):
             self.assertTrue(store.start_session_verification(first.session_id))
             self.assertFalse(store.start_session_verification(first.session_id))
 
+    def test_stale_verifying_session_recovers_and_ignores_late_result(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "face.sqlite3"
+            store = MemoryStore(db_path)
+            store.create_template(
+                subject_type="doctor",
+                subject_id="83",
+                embedding=np.array([1.0, 0.0], dtype=np.float32),
+                bbox=[0, 0, 1, 1],
+                source_type="avatar",
+                source_image_hash="hash",
+            )
+            session = store.create_verification_session(
+                request_id="event-1",
+                subject_type="doctor",
+                subject_id="83",
+                admin_id="2112",
+                scene="login",
+                business_event_id="biz-1",
+                record_id=None,
+                action="login",
+                expected_actions=["blink"],
+                ttl_seconds=180,
+            )
+            attempt = store.start_session_verification(session.session_id)
+            old_started_at = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+            with store._connect() as conn:
+                conn.execute(
+                    "UPDATE verification_sessions SET verifying_started_at = ? WHERE session_id = ?",
+                    (old_started_at, session.session_id),
+                )
+
+            self.assertEqual(store.recover_stale_session_verification(session.session_id, 90), 1)
+            recovered = store.get_session(session.session_id)
+
+            self.assertEqual(recovered.status, "issued")
+            self.assertIsNone(recovered.verifying_started_at)
+            self.assertFalse(store.mark_session_failed(session.session_id, "FAIL_ACTION", attempt))
+            self.assertEqual(store.get_session(session.session_id).status, "issued")
+
+    def test_passed_session_cannot_be_overwritten_by_late_failure(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "face.sqlite3"
+            store = MemoryStore(db_path)
+            store.create_template(
+                subject_type="doctor",
+                subject_id="83",
+                embedding=np.array([1.0, 0.0], dtype=np.float32),
+                bbox=[0, 0, 1, 1],
+                source_type="avatar",
+                source_image_hash="hash",
+            )
+            session = store.create_verification_session(
+                request_id="event-1",
+                subject_type="doctor",
+                subject_id="83",
+                admin_id="2112",
+                scene="doctor_audit",
+                business_event_id="biz-1",
+                record_id="record-9",
+                action="audit",
+                expected_actions=["blink"],
+                ttl_seconds=180,
+            )
+            attempt = store.start_session_verification(session.session_id)
+            proof = store.create_proof_for_session(
+                session.session_id,
+                "PASS",
+                ttl_seconds=180,
+                verifying_started_at=attempt,
+            )
+
+            self.assertIsNotNone(proof)
+            self.assertFalse(store.mark_session_failed(session.session_id, "FAIL_ACTION"))
+            self.assertEqual(store.get_session(session.session_id).status, "passed")
+
+    def test_session_persists_action_results_on_pass_and_fail(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = MemoryStore(Path(tmp_dir) / "face.sqlite3")
+            store.create_template(
+                subject_type="doctor",
+                subject_id="83",
+                embedding=np.array([1.0, 0.0], dtype=np.float32),
+                bbox=[0, 0, 1, 1],
+                source_type="avatar",
+                source_image_hash="hash",
+            )
+            pass_session = store.create_verification_session(
+                request_id="event-pass",
+                subject_type="doctor",
+                subject_id="83",
+                admin_id=None,
+                scene="login",
+                business_event_id="biz-pass",
+                record_id=None,
+                action="login",
+                expected_actions=["blink"],
+                ttl_seconds=180,
+            )
+            attempt = store.start_session_verification(pass_session.session_id)
+            pass_results = [{"action": "blink", "passed": True, "score": 1.0, "detail": "ok"}]
+            store.create_proof_for_session(
+                pass_session.session_id,
+                "PASS",
+                ttl_seconds=180,
+                verifying_started_at=attempt,
+                action_results=pass_results,
+            )
+
+            fail_session = store.create_verification_session(
+                request_id="event-fail",
+                subject_type="doctor",
+                subject_id="83",
+                admin_id=None,
+                scene="login",
+                business_event_id="biz-fail",
+                record_id=None,
+                action="login",
+                expected_actions=["nod_head"],
+                ttl_seconds=180,
+            )
+            fail_attempt = store.start_session_verification(fail_session.session_id)
+            fail_results = [{"action": "nod_head", "passed": False, "score": 8.0, "detail": "low"}]
+            store.mark_session_failed(
+                fail_session.session_id,
+                "FAIL_ACTION",
+                verifying_started_at=fail_attempt,
+                action_results=fail_results,
+            )
+
+            self.assertEqual(store.get_session(pass_session.session_id).action_results, pass_results)
+            self.assertEqual(store.get_session(fail_session.session_id).action_results, fail_results)
+
+    def test_proof_requires_current_verifying_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = MemoryStore(Path(tmp_dir) / "face.sqlite3")
+            store.create_template(
+                subject_type="doctor",
+                subject_id="83",
+                embedding=np.array([1.0, 0.0], dtype=np.float32),
+                bbox=[0, 0, 1, 1],
+                source_type="avatar",
+                source_image_hash="hash",
+            )
+            session = store.create_verification_session(
+                request_id=None,
+                subject_type="doctor",
+                subject_id="83",
+                admin_id=None,
+                scene="login",
+                business_event_id="biz-1",
+                record_id=None,
+                action="login",
+                expected_actions=["blink"],
+                ttl_seconds=180,
+            )
+
+            self.assertIsNone(store.create_proof_for_session(session.session_id, "PASS", 180))
+            attempt = store.start_session_verification(session.session_id)
+            self.assertIsNone(
+                store.create_proof_for_session(
+                    session.session_id,
+                    "PASS",
+                    ttl_seconds=180,
+                    verifying_started_at="stale-attempt",
+                )
+            )
+            self.assertIsNotNone(
+                store.create_proof_for_session(
+                    session.session_id,
+                    "PASS",
+                    ttl_seconds=180,
+                    verifying_started_at=attempt,
+                )
+            )
+
     def test_session_requires_active_template(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             store = MemoryStore(Path(tmp_dir) / "face.sqlite3")
@@ -130,7 +307,13 @@ class ProductionStorageTests(unittest.TestCase):
                 ttl_seconds=180,
             )
 
-            proof = store.create_proof_for_session(session.session_id, "PASS", ttl_seconds=180)
+            attempt = store.start_session_verification(session.session_id)
+            proof = store.create_proof_for_session(
+                session.session_id,
+                "PASS",
+                ttl_seconds=180,
+                verifying_started_at=attempt,
+            )
             reopened = MemoryStore(db_path)
             loaded = reopened.get_proof(proof.proof_id)
 
@@ -171,7 +354,13 @@ class ProductionStorageTests(unittest.TestCase):
                 ttl_seconds=180,
             )
 
-            proof = store.create_proof_for_session(session.session_id, "PASS", ttl_seconds=-1)
+            attempt = store.start_session_verification(session.session_id)
+            proof = store.create_proof_for_session(
+                session.session_id,
+                "PASS",
+                ttl_seconds=-1,
+                verifying_started_at=attempt,
+            )
 
             self.assertEqual(store.get_proof(proof.proof_id).status, "expired")
             finalized = store.finalize_proof(proof.proof_id, "biz-1")

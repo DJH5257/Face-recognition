@@ -11,37 +11,40 @@ class Settings(BaseSettings):
     internal_api_key: str = "change-me-face-internal-key"
     cors_origins: str = "*"
     verification_session_ttl_seconds: int = 300
+    verification_processing_timeout_seconds: int = 90
     proof_ttl_seconds: int = 300
 
     insightface_model: str = "buffalo_l"
     insightface_root: str = "~/.insightface"
     insightface_det_size: int = 480
+    insightface_live_det_size: int = 320
     insightface_ctx_id: int = -1
+    insightface_max_concurrent_inferences: int = 2
     face_match_threshold: float = 0.42
     face_match_min_threshold: float = 0.30
     face_match_min_pass_ratio: float = 0.65
-    face_match_embedding_sample: int = 6
+    face_match_embedding_sample: int = 5
 
     liveness_action_min_count: int = 1
     liveness_action_max_count: int = 3
     challenge_ttl_seconds: int = 180
     min_frames_per_action: int = 6
-    max_frames_per_action: int = 18
-    max_total_frames: int = 72
+    max_frames_per_action: int = 32
+    max_total_frames: int = 90
     min_action_duration_ms: int = 1500
     max_action_duration_ms: int = 5000
     max_frame_gap_ms: int = 900
-    min_unique_frame_ratio: float = 0.65
-    duplicate_frame_hash_size: int = 8
+    min_unique_frame_ratio: float = 0.55
+    duplicate_frame_hash_size: int = 12
     min_face_frame_ratio: float = 0.57
     face_consistency_threshold: float = 0.42
     face_consistency_min_pass_ratio: float = 0.66
     blink_ear_threshold: float = 0.20
     mouth_mar_threshold: float = 0.34
     mouth_mar_delta_threshold: float = 0.07
-    smile_delta_threshold: float = 0.031
+    smile_delta_threshold: float = 0.028
     shake_yaw_range_threshold: float = 16.0
-    nod_pitch_range_threshold: float = 10.5
+    nod_pitch_range_threshold: float = 10.0
 
     anti_spoofing_model_path: str = "models/MiniFASNetV1SE.onnx,models/MiniFASNetV2.yakhyo.onnx"
     anti_spoofing_model_scales: str = "4.0,2.7"
@@ -50,6 +53,20 @@ class Settings(BaseSettings):
     anti_spoofing_min_passed_frame_ratio: float = 0.60
     anti_spoofing_live_class_index: int = 1
     anti_spoofing_sample_frames: int = 6
+    anti_spoofing_max_concurrent_inferences: int = 2
+
+    image_quality_sample_frames: int = 6
+    image_quality_min_laplacian: float = 12.0
+    image_quality_min_brightness: float = 35.0
+    image_quality_max_brightness: float = 225.0
+    image_quality_min_contrast: float = 10.0
+    image_quality_template_min_face_ratio: float = 0.025
+    image_quality_live_min_face_ratio: float = 0.02
+    image_quality_max_face_ratio: float = 0.92
+    image_quality_template_max_abs_yaw: float = 35.0
+    image_quality_template_max_abs_pitch: float = 35.0
+    image_quality_live_max_abs_yaw: float = 55.0
+    image_quality_live_max_abs_pitch: float = 55.0
 
     max_upload_bytes: int = 8 * 1024 * 1024
     max_frame_base64_chars: int = 768 * 1024

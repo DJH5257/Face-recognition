@@ -17,6 +17,10 @@ const MAX_UPLOAD_MB = MAX_UPLOAD_BYTES / 1024 / 1024;
 const ACCEPTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/bmp"]);
 const CAPTURE_DURATION_MS = 2000;
 const CAPTURE_INTERVAL_MS = 200;
+const ACTION_CAPTURE_INTERVAL_MS = Object.freeze({
+  blink: 80,
+  mouth_open: 120,
+});
 const CAPTURE_WIDTH = 360;
 const CAPTURE_JPEG_QUALITY = 0.7;
 const ACTION_SWITCH_PAUSE_MS = 250;
@@ -291,10 +295,11 @@ els.captureBtn.addEventListener("click", async () => {
 async function captureFramesForAction(action) {
   const frames = [];
   const started = performance.now();
-  const frameCount = Math.max(2, Math.floor(CAPTURE_DURATION_MS / CAPTURE_INTERVAL_MS) + 1);
+  const intervalMs = captureIntervalForAction(action);
+  const frameCount = Math.max(2, Math.ceil(CAPTURE_DURATION_MS / intervalMs) + 1);
 
   for (let index = 0; index < frameCount; index += 1) {
-    const scheduledAt = started + Math.min(index * CAPTURE_INTERVAL_MS, CAPTURE_DURATION_MS);
+    const scheduledAt = started + Math.min(index * intervalMs, CAPTURE_DURATION_MS);
     const waitMs = scheduledAt - performance.now();
     if (waitMs > 0) await sleep(waitMs);
     if (!isVideoReady()) {
@@ -308,6 +313,10 @@ async function captureFramesForAction(action) {
     });
   }
   return frames;
+}
+
+function captureIntervalForAction(action) {
+  return ACTION_CAPTURE_INTERVAL_MS[action] || CAPTURE_INTERVAL_MS;
 }
 
 function captureJpegDataUrl() {

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 from typing import Iterable, List, Optional, Tuple
 
 import cv2
@@ -30,7 +30,10 @@ class AntiSpoofingModel:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._lock = Lock()
+        self._load_lock = Lock()
+        self._detector_lock = Lock()
+        max_concurrent = max(1, int(self.settings.anti_spoofing_max_concurrent_inferences))
+        self._inference_gate = BoundedSemaphore(max_concurrent)
         self._sessions: Optional[List[Tuple[ort.InferenceSession, str, float]]] = None
         self._face_detector = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -49,7 +52,7 @@ class AntiSpoofingModel:
         for index, frame in enumerate(selected):
             frame_bbox = selected_bboxes[index] if index < len(selected_bboxes) else None
             frame_bbox = frame_bbox or self._detect_face_bbox(frame) or bbox
-            with self._lock:
+            with self._inference_gate:
                 model_probs = []
                 for session, input_name, scale in self._ensure_sessions():
                     crop = _crop_face(frame, frame_bbox, scale)
@@ -89,39 +92,41 @@ class AntiSpoofingModel:
         )
 
     def preload(self) -> None:
-        with self._lock:
-            self._ensure_sessions()
+        self._ensure_sessions()
 
     def _ensure_sessions(self) -> List[Tuple[ort.InferenceSession, str, float]]:
         if self._sessions is None:
-            model_paths = [
-                item.strip()
-                for item in self.settings.anti_spoofing_model_path.split(",")
-                if item.strip()
-            ]
-            if not model_paths:
-                raise FileNotFoundError("未配置反欺骗模型")
-            scales = _parse_scales(self.settings.anti_spoofing_model_scales, len(model_paths))
-            sessions: List[Tuple[ort.InferenceSession, str, float]] = []
-            for item, scale in zip(model_paths, scales):
-                model_path = Path(item)
-                if not model_path.is_absolute():
-                    model_path = Path.cwd() / model_path
-                if not model_path.exists():
-                    raise FileNotFoundError(f"反欺骗模型不存在：{model_path}")
-                session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
-                sessions.append((session, session.get_inputs()[0].name, scale))
-            self._sessions = sessions
+            with self._load_lock:
+                if self._sessions is None:
+                    model_paths = [
+                        item.strip()
+                        for item in self.settings.anti_spoofing_model_path.split(",")
+                        if item.strip()
+                    ]
+                    if not model_paths:
+                        raise FileNotFoundError("未配置反欺骗模型")
+                    scales = _parse_scales(self.settings.anti_spoofing_model_scales, len(model_paths))
+                    sessions: List[Tuple[ort.InferenceSession, str, float]] = []
+                    for item, scale in zip(model_paths, scales):
+                        model_path = Path(item)
+                        if not model_path.is_absolute():
+                            model_path = Path.cwd() / model_path
+                        if not model_path.exists():
+                            raise FileNotFoundError(f"反欺骗模型不存在：{model_path}")
+                        session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+                        sessions.append((session, session.get_inputs()[0].name, scale))
+                    self._sessions = sessions
         return self._sessions
 
     def _detect_face_bbox(self, bgr: np.ndarray) -> Optional[List[float]]:
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        faces = self._face_detector.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=4,
-            minSize=(60, 60),
-        )
+        with self._detector_lock:
+            faces = self._face_detector.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=4,
+                minSize=(60, 60),
+            )
         if len(faces) == 0:
             return None
         x, y, w, h = max(faces, key=lambda item: int(item[2]) * int(item[3]))

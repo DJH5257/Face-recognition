@@ -50,6 +50,22 @@ def _token_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _action_results_to_json(action_results: Optional[List[dict]]) -> Optional[str]:
+    if action_results is None:
+        return None
+    return json.dumps(action_results, ensure_ascii=False, separators=(",", ":"))
+
+
+def _action_results_from_json(value: Optional[str]) -> List[dict]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
     if column_name not in columns:
@@ -57,6 +73,17 @@ def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, 
         conn.execute(
             f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type} NOT NULL DEFAULT {default_value}"
         )
+
+
+def _ensure_nullable_column(
+    conn: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_type: str,
+) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
 
 @dataclass
@@ -120,8 +147,10 @@ class VerificationSession:
     result_code: str
     issued_at: datetime
     expires_at: datetime
+    verifying_started_at: Optional[datetime]
     verified_at: Optional[datetime]
     proof_id: Optional[str]
+    action_results: List[dict] = field(default_factory=list)
 
     def is_expired(self) -> bool:
         return _utcnow() > self.expires_at
@@ -274,6 +303,45 @@ class Store:
             ).fetchone()
         return _row_to_template(row) if row else None
 
+    def list_templates(self, subject_type: str, subject_id: str) -> List[FaceTemplate]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM face_templates
+                WHERE subject_type = ? AND subject_id = ?
+                ORDER BY template_version DESC
+                """,
+                (subject_type, subject_id),
+            ).fetchall()
+        return [_row_to_template(row) for row in rows]
+
+    def revoke_template(self, template_id: str) -> Optional[FaceTemplate]:
+        now = _utcnow()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM face_templates WHERE template_id = ?",
+                (template_id,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            if row["status"] == "active":
+                conn.execute(
+                    """
+                    UPDATE face_templates
+                    SET status = 'revoked', revoked_at = ?
+                    WHERE template_id = ? AND status = 'active'
+                    """,
+                    (_to_iso(now), template_id),
+                )
+            updated = conn.execute(
+                "SELECT * FROM face_templates WHERE template_id = ?",
+                (template_id,),
+            ).fetchone()
+            conn.commit()
+        return _row_to_template(updated) if updated else None
+
     def create_verification_session(
         self,
         request_id: Optional[str],
@@ -364,67 +432,173 @@ class Store:
             ).fetchone()
         return bool(row and row["upload_token_hash"] == _token_hash(upload_token))
 
-    def start_session_verification(self, session_id: str) -> bool:
+    def start_session_verification(self, session_id: str) -> Optional[str]:
+        started_at = _to_iso(_utcnow())
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
                 UPDATE verification_sessions
-                SET status = 'verifying'
+                SET status = 'verifying',
+                    result_code = 'VERIFYING',
+                    verifying_started_at = ?,
+                    verified_at = NULL
                 WHERE session_id = ? AND status = 'issued'
                 """,
-                (session_id,),
+                (started_at, session_id),
             )
             conn.commit()
+        return started_at if row.rowcount == 1 else None
+
+    def recover_stale_session_verification(self, session_id: str, timeout_seconds: int) -> int:
+        if timeout_seconds <= 0:
+            return 0
+        now = _utcnow()
+        stale_before = _to_iso(now - timedelta(seconds=timeout_seconds))
+        now_iso = _to_iso(now)
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            expired = conn.execute(
+                """
+                UPDATE verification_sessions
+                SET status = 'failed',
+                    result_code = 'EXPIRED_SESSION',
+                    verifying_started_at = NULL,
+                    verified_at = ?
+                WHERE session_id = ?
+                  AND status = 'verifying'
+                  AND (verifying_started_at IS NULL OR verifying_started_at <= ?)
+                  AND expires_at <= ?
+                """,
+                (now_iso, session_id, stale_before, now_iso),
+            )
+            reset = conn.execute(
+                """
+                UPDATE verification_sessions
+                SET status = 'issued',
+                    result_code = 'ISSUED',
+                    verifying_started_at = NULL,
+                    verified_at = NULL
+                WHERE session_id = ?
+                  AND status = 'verifying'
+                  AND (verifying_started_at IS NULL OR verifying_started_at <= ?)
+                  AND expires_at > ?
+                """,
+                (session_id, stale_before, now_iso),
+            )
+            conn.commit()
+        return expired.rowcount + reset.rowcount
+
+    def mark_session_failed(
+        self,
+        session_id: str,
+        result_code: str,
+        verifying_started_at: Optional[str] = None,
+        action_results: Optional[List[dict]] = None,
+    ) -> bool:
+        now = _utcnow()
+        action_results_json = _action_results_to_json(action_results)
+        with self._lock, self._connect() as conn:
+            if verifying_started_at:
+                row = conn.execute(
+                    """
+                    UPDATE verification_sessions
+                    SET status = 'failed',
+                        result_code = ?,
+                        verified_at = ?,
+                        verifying_started_at = NULL,
+                        action_results_json = COALESCE(?, action_results_json)
+                    WHERE session_id = ?
+                      AND status = 'verifying'
+                      AND verifying_started_at = ?
+                    """,
+                    (result_code, _to_iso(now), action_results_json, session_id, verifying_started_at),
+                )
+            else:
+                row = conn.execute(
+                    """
+                    UPDATE verification_sessions
+                    SET status = 'failed',
+                        result_code = ?,
+                        verified_at = ?,
+                        verifying_started_at = NULL,
+                        action_results_json = COALESCE(?, action_results_json)
+                    WHERE session_id = ?
+                      AND status IN ('issued', 'verifying')
+                    """,
+                    (result_code, _to_iso(now), action_results_json, session_id),
+                )
         return row.rowcount == 1
 
-    def mark_session_failed(self, session_id: str, result_code: str) -> None:
-        now = _utcnow()
+    def reset_session_verification(
+        self,
+        session_id: str,
+        verifying_started_at: Optional[str] = None,
+    ) -> bool:
         with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE verification_sessions
-                SET status = 'failed', result_code = ?, verified_at = ?
-                WHERE session_id = ?
-                """,
-                (result_code, _to_iso(now), session_id),
-            )
-
-    def reset_session_verification(self, session_id: str) -> None:
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE verification_sessions
-                SET status = 'issued', result_code = 'ISSUED', verified_at = NULL
-                WHERE session_id = ?
-                """,
-                (session_id,),
-            )
+            if verifying_started_at:
+                row = conn.execute(
+                    """
+                    UPDATE verification_sessions
+                    SET status = 'issued',
+                        result_code = 'ISSUED',
+                        verifying_started_at = NULL,
+                        verified_at = NULL
+                    WHERE session_id = ?
+                      AND status = 'verifying'
+                      AND verifying_started_at = ?
+                    """,
+                    (session_id, verifying_started_at),
+                )
+            else:
+                row = conn.execute(
+                    """
+                    UPDATE verification_sessions
+                    SET status = 'issued',
+                        result_code = 'ISSUED',
+                        verifying_started_at = NULL,
+                        verified_at = NULL
+                    WHERE session_id = ?
+                      AND status = 'verifying'
+                    """,
+                    (session_id,),
+                )
+        return row.rowcount == 1
 
     def create_proof_for_session(
         self,
         session_id: str,
         result_code: str,
         ttl_seconds: int,
+        verifying_started_at: Optional[str] = None,
+        action_results: Optional[List[dict]] = None,
     ) -> Optional[VerificationProof]:
         now = _utcnow()
         expires_at = now + timedelta(seconds=ttl_seconds)
+        action_results_json = _action_results_to_json(action_results)
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            session = conn.execute(
-                "SELECT * FROM verification_sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            if session is None:
-                conn.rollback()
-                return None
             existing = conn.execute(
                 "SELECT * FROM verification_proofs WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
+
             if existing is not None:
                 conn.commit()
                 return _row_to_proof(existing)
+
+            session = conn.execute(
+                """
+                SELECT * FROM verification_sessions
+                WHERE session_id = ? AND status = 'verifying'
+                """,
+                (session_id,),
+            ).fetchone()
+            if session is None or (
+                verifying_started_at and session["verifying_started_at"] != verifying_started_at
+            ):
+                conn.rollback()
+                return None
 
             proof_id = str(uuid4())
             conn.execute(
@@ -456,10 +630,25 @@ class Store:
             conn.execute(
                 """
                 UPDATE verification_sessions
-                SET status = 'passed', result_code = ?, verified_at = ?, proof_id = ?
+                SET status = 'passed',
+                    result_code = ?,
+                    verified_at = ?,
+                    proof_id = ?,
+                    verifying_started_at = NULL,
+                    action_results_json = COALESCE(?, action_results_json)
                 WHERE session_id = ?
+                  AND status = 'verifying'
+                  AND (? IS NULL OR verifying_started_at = ?)
                 """,
-                (result_code, _to_iso(now), proof_id, session_id),
+                (
+                    result_code,
+                    _to_iso(now),
+                    proof_id,
+                    action_results_json,
+                    session_id,
+                    verifying_started_at,
+                    verifying_started_at,
+                ),
             )
             proof = conn.execute(
                 "SELECT * FROM verification_proofs WHERE proof_id = ?",
@@ -558,20 +747,22 @@ class Store:
                     admin_id TEXT,
                     scene TEXT NOT NULL,
                     business_event_id TEXT NOT NULL,
-                    record_id TEXT,
-                    action TEXT,
-                    template_id TEXT NOT NULL,
-                    template_version INTEGER NOT NULL,
-                    expected_actions_json TEXT NOT NULL,
+                        record_id TEXT,
+                        action TEXT,
+                        template_id TEXT NOT NULL,
+                        template_version INTEGER NOT NULL,
+                        expected_actions_json TEXT NOT NULL,
                     upload_token TEXT NOT NULL,
                     upload_token_hash TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    result_code TEXT NOT NULL,
-                    issued_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    verified_at TEXT,
-                    proof_id TEXT
-                );
+                        result_code TEXT NOT NULL,
+                        issued_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        verifying_started_at TEXT,
+                        verified_at TEXT,
+                        proof_id TEXT,
+                        action_results_json TEXT
+                    );
 
                 CREATE INDEX IF NOT EXISTS idx_verification_sessions_event
                     ON verification_sessions(business_event_id, scene, subject_type, subject_id);
@@ -600,6 +791,8 @@ class Store:
                 """
             )
             _ensure_column(conn, "verification_sessions", "upload_token", "TEXT")
+            _ensure_nullable_column(conn, "verification_sessions", "verifying_started_at", "TEXT")
+            _ensure_nullable_column(conn, "verification_sessions", "action_results_json", "TEXT")
 
 
 class MemoryStore(Store):
@@ -642,8 +835,10 @@ def _row_to_session(row: sqlite3.Row) -> VerificationSession:
         result_code=row["result_code"],
         issued_at=_from_iso(row["issued_at"]) or _utcnow(),
         expires_at=_from_iso(row["expires_at"]) or _utcnow(),
+        verifying_started_at=_from_iso(row["verifying_started_at"]),
         verified_at=_from_iso(row["verified_at"]),
         proof_id=row["proof_id"],
+        action_results=_action_results_from_json(row["action_results_json"]),
     )
 
 

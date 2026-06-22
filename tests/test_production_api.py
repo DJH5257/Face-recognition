@@ -1,6 +1,7 @@
 import base64
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import cv2
@@ -22,7 +23,7 @@ from backend.app.stores import MemoryStore
 class FakeFace:
     def __init__(self, embedding):
         self.embedding = np.asarray(embedding, dtype=np.float32)
-        self.bbox = [0.0, 0.0, 10.0, 10.0]
+        self.bbox = [20.0, 20.0, 76.0, 76.0]
 
 
 class FakeFaceEngine:
@@ -34,7 +35,11 @@ class FakeFaceEngine:
 
 
 def make_image_payload():
-    image = np.zeros((16, 16, 3), dtype=np.uint8)
+    y, x = np.indices((96, 96))
+    base = 120 + ((x * 13 + y * 17) % 80)
+    texture = (((x // 4 + y // 4) % 2) * 45)
+    gray = np.clip(base + texture - 20, 45, 225).astype(np.uint8)
+    image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     ok, encoded = cv2.imencode(".jpg", image)
     if not ok:
         raise RuntimeError("could not encode jpeg")
@@ -54,6 +59,16 @@ def make_verify_request():
     )
 
 
+def fake_quality(*_args, **_kwargs):
+    return {
+        "action": "pose_quality",
+        "label": "姿态质量",
+        "passed": True,
+        "score": 1.0,
+        "detail": "mock quality",
+    }
+
+
 class ProductionApiTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -62,6 +77,7 @@ class ProductionApiTests(unittest.TestCase):
         self.original_insightface_root = main.settings.insightface_root
         self.original_face_engine = main.face_engine
         self.original_evaluate = main._evaluate_liveness_frames
+        self.original_pose_quality = main._validate_pose_quality
         main.store = MemoryStore(Path(self.tmp.name) / "face.sqlite3")
         main.settings.internal_api_key = "test-key"
         insightface_root = Path(self.tmp.name) / "insightface-home" / ".insightface"
@@ -77,6 +93,7 @@ class ProductionApiTests(unittest.TestCase):
             (model_dir / name).touch()
         main.settings.insightface_root = str(insightface_root)
         main.face_engine = FakeFaceEngine([FakeFace([1.0, 0.0])])
+        main._validate_pose_quality = fake_quality
 
     def tearDown(self):
         main.store = self.original_store
@@ -84,6 +101,7 @@ class ProductionApiTests(unittest.TestCase):
         main.settings.insightface_root = self.original_insightface_root
         main.face_engine = self.original_face_engine
         main._evaluate_liveness_frames = self.original_evaluate
+        main._validate_pose_quality = self.original_pose_quality
         self.tmp.cleanup()
 
     def test_internal_routes_require_api_key(self):
@@ -110,6 +128,10 @@ class ProductionApiTests(unittest.TestCase):
         )
         self.assertEqual(template_response.subject_type, "doctor")
         self.assertEqual(template_response.subject_id, "83")
+        templates = main.list_subject_templates("doctor", "83")
+        self.assertEqual(templates.active_template_id, template_response.template_id)
+        self.assertEqual(len(templates.templates), 1)
+        self.assertEqual(templates.templates[0].status, "active")
 
         session_payload = VerificationSessionCreateRequest(
             request_id="req-1",
@@ -206,6 +228,24 @@ class ProductionApiTests(unittest.TestCase):
         self.assertFalse(after_finalize.valid)
         self.assertEqual(after_finalize.status, "finalized")
 
+    def test_template_revoke_removes_active_template(self):
+        template_response = main.create_template(
+            TemplateCreateRequest(
+                subject_type="doctor",
+                subject_id="83",
+                image=make_image_payload(),
+                source_type="avatar",
+            )
+        )
+
+        revoked = main.revoke_template(template_response.template_id)
+        templates = main.list_subject_templates("doctor", "83")
+
+        self.assertTrue(revoked.revoked)
+        self.assertEqual(revoked.status, "revoked")
+        self.assertIsNone(templates.active_template_id)
+        self.assertEqual(templates.templates[0].status, "revoked")
+
     def test_failed_verification_does_not_issue_proof(self):
         main.create_template(
             TemplateCreateRequest(
@@ -256,6 +296,57 @@ class ProductionApiTests(unittest.TestCase):
         self.assertFalse(response.passed)
         self.assertEqual(response.result_code, "FAIL_FACE_MISMATCH")
         self.assertIsNone(response.proof_id)
+
+    def test_verify_route_recovers_stale_verifying_session(self):
+        main.create_template(
+            TemplateCreateRequest(
+                subject_type="doctor",
+                subject_id="85",
+                image=make_image_payload(),
+            )
+        )
+        session = main.create_verification_session(
+            BackgroundTasks(),
+            VerificationSessionCreateRequest(
+                subject_type="doctor",
+                subject_id="85",
+                scene="login",
+                business_event_id="biz-3",
+            ),
+        )
+        stale_attempt = main.store.start_session_verification(session.session_id)
+        self.assertTrue(stale_attempt)
+        stale_started_at = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        with main.store._connect() as conn:
+            conn.execute(
+                "UPDATE verification_sessions SET verifying_started_at = ? WHERE session_id = ?",
+                (stale_started_at, session.session_id),
+            )
+
+        def fake_pass(*_args, **_kwargs):
+            return main.VerificationEvaluation(
+                passed=True,
+                result_code="PASS",
+                anti_spoofing_passed=True,
+                anti_spoofing_score=0.91,
+                face_matched=True,
+                similarity=0.88,
+                threshold=main.settings.face_match_threshold,
+                action_results=[],
+                live_embedding=np.array([1.0, 0.0], dtype=np.float32),
+                message="活体检测通过，且为本人",
+            )
+
+        main._evaluate_liveness_frames = fake_pass
+        response = main.verify_verification_session(
+            session.session_id,
+            make_verify_request(),
+            authorization=f"Bearer {session.upload_token}",
+        )
+
+        self.assertTrue(response.passed)
+        self.assertIsNotNone(response.proof_id)
+        self.assertEqual(main.store.get_session(session.session_id).status, "passed")
 
 
 if __name__ == "__main__":

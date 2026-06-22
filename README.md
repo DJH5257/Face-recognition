@@ -108,15 +108,33 @@ FACE_DEMO_VERIFICATION_SESSION_TTL_SECONDS=300
 FACE_DEMO_PROOF_TTL_SECONDS=300
 FACE_DEMO_INSIGHTFACE_MODEL=buffalo_l
 FACE_DEMO_INSIGHTFACE_ROOT=/opt/face-verify-demo/shared/insightface-home/.insightface
+FACE_DEMO_INSIGHTFACE_DET_SIZE=480
+FACE_DEMO_INSIGHTFACE_LIVE_DET_SIZE=320
+FACE_DEMO_FACE_MATCH_EMBEDDING_SAMPLE=5
 FACE_DEMO_LIVENESS_ACTION_MIN_COUNT=1
 FACE_DEMO_LIVENESS_ACTION_MAX_COUNT=3
 FACE_DEMO_MIN_FRAMES_PER_ACTION=6
-FACE_DEMO_MAX_TOTAL_FRAMES=72
+FACE_DEMO_MAX_FRAMES_PER_ACTION=32
+FACE_DEMO_MAX_TOTAL_FRAMES=90
+FACE_DEMO_MIN_UNIQUE_FRAME_RATIO=0.55
+FACE_DEMO_DUPLICATE_FRAME_HASH_SIZE=12
+FACE_DEMO_IMAGE_QUALITY_SAMPLE_FRAMES=6
+FACE_DEMO_IMAGE_QUALITY_MIN_LAPLACIAN=12
+FACE_DEMO_IMAGE_QUALITY_MIN_BRIGHTNESS=35
+FACE_DEMO_IMAGE_QUALITY_MAX_BRIGHTNESS=225
+FACE_DEMO_IMAGE_QUALITY_MIN_CONTRAST=10
+FACE_DEMO_IMAGE_QUALITY_TEMPLATE_MIN_FACE_RATIO=0.025
+FACE_DEMO_IMAGE_QUALITY_LIVE_MIN_FACE_RATIO=0.02
+FACE_DEMO_IMAGE_QUALITY_MAX_FACE_RATIO=0.92
+FACE_DEMO_IMAGE_QUALITY_TEMPLATE_MAX_ABS_YAW=35
+FACE_DEMO_IMAGE_QUALITY_TEMPLATE_MAX_ABS_PITCH=35
+FACE_DEMO_IMAGE_QUALITY_LIVE_MAX_ABS_YAW=55
+FACE_DEMO_IMAGE_QUALITY_LIVE_MAX_ABS_PITCH=55
 FACE_DEMO_ANTI_SPOOFING_THRESHOLD=0.35
 FACE_DEMO_ANTI_SPOOFING_MODEL_PATH=models/MiniFASNetV1SE.onnx,models/MiniFASNetV2.yakhyo.onnx
 ```
 
-阈值需要用你的摄像头、光照、真人样本、照片、屏幕、视频回放和低性能设备重新校准。
+阈值需要用你的摄像头、光照、真人样本、照片、屏幕、视频回放和低性能设备重新校准。图像质量门禁会先拦截明显模糊、过暗、过曝、低对比度、脸过小、脸框明显越界或姿态明显偏转的登记照和活体抽样帧，避免烂图污染模板或进入重模型推理。
 
 ## 生产部署建议
 
@@ -147,10 +165,10 @@ FACE_DEMO_INSIGHTFACE_MODEL=buffalo_l
 FACE_DEMO_INSIGHTFACE_ROOT=/opt/face-verify-demo/shared/insightface-home/.insightface
 ```
 
-高配服务器不建议设置 ONNXRuntime 线程数，让运行时按硬件自动调度以获得最佳识别性能。只有在低配机器上出现冷启动 CPU 打满时，才临时设置：
+高配服务器不建议设置 ONNXRuntime 线程数，让运行时按硬件自动调度以获得最佳识别性能。4 核 CPU 服务器可先用 2/1 控制单请求 CPU 占用；2 核机器建议用 1/1 或不设置：
 
 ```bash
-FACE_DEMO_ONNX_INTRA_OP_THREADS=1
+FACE_DEMO_ONNX_INTRA_OP_THREADS=2
 FACE_DEMO_ONNX_INTER_OP_THREADS=1
 ```
 
@@ -208,7 +226,17 @@ X-Face-Api-Key: ...
 }
 ```
 
-成功后返回 `template_id`、`template_version` 和 bbox，不返回 embedding。同一人员新增模板会原子吊销旧 active 模板。
+成功后返回 `template_id`、`template_version` 和 bbox，不返回 embedding。同一人员新增模板会原子吊销旧 active 模板。登记照会先经过轻量图像质量和人脸框质量门禁。
+
+### 生产：查询和撤销模板
+
+```http
+GET /v1/internal/templates/subjects/{subject_type}/{subject_id}
+POST /v1/internal/templates/{template_id}/revoke
+X-Face-Api-Key: ...
+```
+
+查询接口返回该人员的模板版本列表、当前 active 模板 ID、状态、来源、图片 hash、bbox 和创建/激活/撤销时间。撤销接口会把 active 模板置为 `revoked`；撤销后该人员不能创建新的核验会话，直到重新上传模板。
 
 ### 生产：创建核验会话
 
@@ -254,7 +282,7 @@ Content-Type: application/json
 }
 ```
 
-只有动作、重复帧、单人脸稳定性、PAD 和本人比对全部通过才签发 `proof_id`。失败不会签发 proof。
+只有图像质量、动作、重复帧、单人脸稳定性、PAD 和本人比对全部通过才签发 `proof_id`。失败不会签发 proof。服务端会把 `action_results` 持久化到核验会话，便于后续排查高频失败动作、图像质量、PAD 或人脸比对问题。
 
 ### 生产：查询和完成 proof
 

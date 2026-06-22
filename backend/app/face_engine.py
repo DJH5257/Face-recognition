@@ -4,8 +4,8 @@ import base64
 import binascii
 import os
 from dataclasses import dataclass
-from threading import Lock
-from typing import List, Optional
+from threading import BoundedSemaphore, Lock
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -57,23 +57,32 @@ class FaceEmbedding:
 class FaceEngine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._lock = Lock()
-        self._app: Optional[FaceAnalysis] = None
+        self._load_lock = Lock()
+        max_concurrent = max(1, int(self.settings.insightface_max_concurrent_inferences))
+        self._inference_gate = BoundedSemaphore(max_concurrent)
+        self._apps: Dict[int, FaceAnalysis] = {}
 
-    def _ensure_loaded(self) -> FaceAnalysis:
-        if self._app is None:
-            app = FaceAnalysis(
-                name=self.settings.insightface_model,
-                root=self.settings.insightface_root,
-                allowed_modules=["detection", "recognition"],
-                providers=self.settings.insightface_providers,
-            )
-            app.prepare(
-                ctx_id=self.settings.insightface_ctx_id,
-                det_size=(self.settings.insightface_det_size, self.settings.insightface_det_size),
-            )
-            self._app = app
-        return self._app
+    def _ensure_loaded(self, det_size: Optional[int] = None) -> FaceAnalysis:
+        det_size = int(det_size or self.settings.insightface_det_size)
+        if det_size not in self._apps:
+            with self._load_lock:
+                if det_size in self._apps:
+                    return self._apps[det_size]
+                self._apps[det_size] = self._create_app(det_size)
+        return self._apps[det_size]
+
+    def _create_app(self, det_size: int) -> FaceAnalysis:
+        app = FaceAnalysis(
+            name=self.settings.insightface_model,
+            root=self.settings.insightface_root,
+            allowed_modules=["detection", "recognition"],
+            providers=self.settings.insightface_providers,
+        )
+        app.prepare(
+            ctx_id=self.settings.insightface_ctx_id,
+            det_size=(det_size, det_size),
+        )
+        return app
 
     def extract_largest_face(self, bgr: np.ndarray) -> Optional[FaceEmbedding]:
         faces = self.extract_faces(bgr)
@@ -81,9 +90,9 @@ class FaceEngine:
             return None
         return max(faces, key=lambda item: _bbox_area(np.asarray(item.bbox, dtype=np.float32)))
 
-    def extract_faces(self, bgr: np.ndarray) -> List[FaceEmbedding]:
-        app = self._ensure_loaded()
-        with self._lock:
+    def extract_faces(self, bgr: np.ndarray, det_size: Optional[int] = None) -> List[FaceEmbedding]:
+        app = self._ensure_loaded(det_size)
+        with self._inference_gate:
             faces = app.get(bgr)
         if not faces:
             return []
