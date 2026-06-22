@@ -119,8 +119,8 @@ assert(
   constants.ACTION_GUIDANCE.blink.includes("再睁开"),
   "blink guidance should tell users to reopen eyes",
 );
-assert(appJs.includes("timing_nonce: state.timingNonce"), "frontend must echo timing nonce");
-assert(appJs.includes("capture_delays_ms"), "frontend must consume server capture delays");
+assert(!appJs.includes("timing_nonce"), "frontend should not require timing nonce");
+assert(!appJs.includes("capture_delays_ms"), "frontend should not consume server capture delays");
 
 const formatted = vm.runInContext(
   "formatErrorDetail([{ msg: 'List should have at least 1 item' }, { msg: 'Extra inputs are not permitted' }])",

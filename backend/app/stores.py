@@ -107,8 +107,6 @@ class Challenge:
     id: str
     actions: List[str]
     expires_at: datetime
-    capture_delays_ms: List[int] = field(default_factory=list)
-    timing_nonce: Optional[str] = None
     enrollment_id: Optional[str] = None
     liveness_passed: bool = False
     live_embedding: Optional[np.ndarray] = None
@@ -152,8 +150,6 @@ class VerificationSession:
     template_id: str
     template_version: int
     expected_actions: List[str]
-    capture_delays_ms: List[int]
-    timing_nonce: Optional[str]
     upload_token: str
     status: str
     result_code: str
@@ -219,15 +215,11 @@ class Store:
         actions: List[str],
         ttl_seconds: int,
         enrollment_id: Optional[str] = None,
-        capture_delays_ms: Optional[List[int]] = None,
-        timing_nonce: Optional[str] = None,
     ) -> Challenge:
         item = Challenge(
             id=str(uuid4()),
             actions=actions,
             enrollment_id=enrollment_id,
-            capture_delays_ms=list(capture_delays_ms or []),
-            timing_nonce=timing_nonce,
             expires_at=_utcnow() + timedelta(seconds=ttl_seconds),
         )
         with self._lock:
@@ -370,8 +362,6 @@ class Store:
         action: Optional[str],
         expected_actions: List[str],
         ttl_seconds: int,
-        capture_delays_ms: Optional[List[int]] = None,
-        timing_nonce: Optional[str] = None,
     ) -> Optional[VerificationSession]:
         template = self.get_active_template(subject_type, subject_id)
         if template is None:
@@ -393,12 +383,11 @@ class Store:
                     INSERT INTO verification_sessions (
                         session_id, request_id, subject_type, subject_id, admin_id,
                         scene, business_event_id, record_id, action, template_id,
-                        template_version, expected_actions_json, capture_delays_json,
-                        timing_nonce, upload_token,
+                        template_version, expected_actions_json, upload_token,
                         upload_token_hash, status, result_code, issued_at, expires_at,
                         verified_at, proof_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', 'ISSUED', ?, ?, NULL, NULL)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', 'ISSUED', ?, ?, NULL, NULL)
                     """,
                     (
                         session_id,
@@ -413,8 +402,6 @@ class Store:
                         template.template_id,
                         template.template_version,
                         json.dumps(expected_actions),
-                        json.dumps(list(capture_delays_ms or [])),
-                        timing_nonce,
                         upload_token,
                         _token_hash(upload_token),
                         _to_iso(now),
@@ -806,8 +793,6 @@ class Store:
                         template_id TEXT NOT NULL,
                         template_version INTEGER NOT NULL,
                         expected_actions_json TEXT NOT NULL,
-                        capture_delays_json TEXT,
-                        timing_nonce TEXT,
                     upload_token TEXT NOT NULL,
                     upload_token_hash TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -849,8 +834,6 @@ class Store:
             _ensure_column(conn, "verification_sessions", "upload_token", "TEXT")
             _ensure_nullable_column(conn, "verification_sessions", "verifying_started_at", "TEXT")
             _ensure_nullable_column(conn, "verification_sessions", "action_results_json", "TEXT")
-            _ensure_nullable_column(conn, "verification_sessions", "capture_delays_json", "TEXT")
-            _ensure_nullable_column(conn, "verification_sessions", "timing_nonce", "TEXT")
 
 
 class MemoryStore(Store):
@@ -888,8 +871,6 @@ def _row_to_session(row: sqlite3.Row) -> VerificationSession:
         template_id=row["template_id"],
         template_version=int(row["template_version"]),
         expected_actions=list(json.loads(row["expected_actions_json"])),
-        capture_delays_ms=_json_int_list(row["capture_delays_json"]),
-        timing_nonce=row["timing_nonce"],
         upload_token=row["upload_token"],
         status=row["status"],
         result_code=row["result_code"],

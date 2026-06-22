@@ -3,8 +3,6 @@ const state = {
   challengeId: null,
   actions: [],
   labels: {},
-  captureDelaysMs: [],
-  timingNonce: null,
   stream: null,
   cameraReady: false,
   isUploading: false,
@@ -219,8 +217,6 @@ els.challengeBtn.addEventListener("click", async () => {
     state.challengeId = data.challenge_id;
     state.actions = Array.isArray(data.actions) ? data.actions : [];
     state.labels = data.labels || {};
-    state.captureDelaysMs = Array.isArray(data.capture_delays_ms) ? data.capture_delays_ms : [];
-    state.timingNonce = data.timing_nonce || null;
     els.actionsText.textContent = formatActionsText();
     els.livenessText.textContent = "待检测";
     els.livenessText.className = "";
@@ -266,11 +262,6 @@ els.captureBtn.addEventListener("click", async () => {
       if (actionIndex > 0) {
         await sleep(ACTION_SWITCH_PAUSE_MS);
       }
-      const delayMs = Math.max(0, Number(state.captureDelaysMs[actionIndex] || 0));
-      if (delayMs > 0) {
-        els.instruction.textContent = `${label}，准备动作 ${actionIndex + 1}/${state.actions.length}`;
-        await sleep(delayMs);
-      }
       const captured = await captureFramesForAction(action, actionIndex, state.actions.length, label);
       frames.push(...captured);
     }
@@ -281,7 +272,6 @@ els.captureBtn.addEventListener("click", async () => {
       body: JSON.stringify({
         challenge_id: state.challengeId,
         enrollment_id: state.enrollmentId,
-        timing_nonce: state.timingNonce,
         frames,
       }),
       timeoutMs: VERIFY_TIMEOUT_MS,

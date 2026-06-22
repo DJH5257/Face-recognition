@@ -79,11 +79,6 @@ class Settings(BaseSettings):
     liveness_action_weights: str = "mouth_open=24,shake_head=24,nod_head=24,blink=18,smile=18"
     liveness_action_recent_failure_window: int = 2
     liveness_action_recent_failure_factor: float = 0.5
-    liveness_timing_jitter_enabled: bool = True
-    liveness_timing_jitter_required: bool = False
-    liveness_timing_min_delay_ms: int = 150
-    liveness_timing_max_delay_ms: int = 450
-    liveness_timing_tolerance_ms: int = 180
 
     max_upload_bytes: int = 8 * 1024 * 1024
     max_frame_base64_chars: int = 768 * 1024
