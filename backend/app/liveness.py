@@ -20,15 +20,42 @@ ACTION_LABELS: Dict[str, str] = {
 }
 
 
-def random_actions(min_count: int = 1, max_count: int = 3) -> List[str]:
+def random_actions(
+    min_count: int = 1,
+    max_count: int = 3,
+    weights: Optional[Dict[str, float]] = None,
+    reduced_actions: Optional[Iterable[str]] = None,
+    reduction_factor: float = 0.5,
+) -> List[str]:
     max_count = max(1, min(max_count, len(ACTION_LABELS)))
     min_count = max(1, min(min_count, max_count))
     count = min_count + secrets.randbelow(max_count - min_count + 1)
-    actions = list(ACTION_LABELS.keys())
-    for index in range(len(actions) - 1, 0, -1):
-        swap_index = secrets.randbelow(index + 1)
-        actions[index], actions[swap_index] = actions[swap_index], actions[index]
-    return actions[:count]
+    available = list(ACTION_LABELS.keys())
+    selected: List[str] = []
+    reduced_set = set(reduced_actions or [])
+    normalized_weights = weights or {}
+    factor = min(max(float(reduction_factor), 0.05), 1.0)
+
+    while available and len(selected) < count:
+        weighted = []
+        total = 0.0
+        for action in available:
+            weight = max(float(normalized_weights.get(action, 1.0)), 0.05)
+            if action in reduced_set:
+                weight = max(weight * factor, 0.05)
+            weighted.append((action, weight))
+            total += weight
+        pick = secrets.randbelow(max(1, int(total * 1000))) / 1000.0
+        cursor = 0.0
+        chosen = weighted[-1][0]
+        for action, weight in weighted:
+            cursor += weight
+            if pick < cursor:
+                chosen = action
+                break
+        selected.append(chosen)
+        available.remove(chosen)
+    return selected
 
 
 @dataclass

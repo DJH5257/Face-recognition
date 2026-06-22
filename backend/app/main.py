@@ -6,12 +6,13 @@ from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
 import secrets
+from threading import BoundedSemaphore
 from typing import Optional
 
 import cv2
 import mediapipe as mp
 import numpy as np
-from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,6 +21,7 @@ from .anti_spoofing import AntiSpoofingModel
 from .config import Settings, get_settings
 from .face_engine import FaceEngine, cosine_similarity, decode_base64_image, decode_image_bytes
 from .liveness import ACTION_LABELS, _extract_metrics, random_actions, verify_liveness_actions
+from .rate_limit import InMemoryFailureLimiter
 from .schemas import (
     ChallengeRequest,
     ChallengeResponse,
@@ -43,11 +45,14 @@ from .schemas import (
     VerificationSessionVerifyResponse,
 )
 from .stores import store
+from .template_crypto import TemplateCryptoError
 
 
 settings = get_settings()
 face_engine = FaceEngine(settings)
 anti_spoofing_model = AntiSpoofingModel(settings)
+failure_limiter = InMemoryFailureLimiter()
+verification_semaphore = BoundedSemaphore(max(1, settings.verification_max_concurrent_requests))
 
 app = FastAPI(title="Face Verification Liveness Demo")
 app.add_middleware(
@@ -185,16 +190,22 @@ def create_liveness_challenge(
     if enrollment is None:
         raise HTTPException(status_code=404, detail="基准人脸不存在，请重新上传")
 
+    actions = _select_liveness_actions(settings)
+    capture_delays_ms, timing_nonce = _create_capture_timing_plan(actions, settings)
     challenge = store.create_challenge(
-        random_actions(settings.liveness_action_min_count, settings.liveness_action_max_count),
+        actions,
         ttl_seconds=settings.challenge_ttl_seconds,
         enrollment_id=payload.enrollment_id,
+        capture_delays_ms=capture_delays_ms,
+        timing_nonce=timing_nonce,
     )
     background_tasks.add_task(_preload_anti_spoofing_model)
     return ChallengeResponse(
         challenge_id=challenge.id,
         actions=challenge.actions,
         labels=ACTION_LABELS,
+        capture_delays_ms=challenge.capture_delays_ms,
+        timing_nonce=challenge.timing_nonce,
     )
 
 
@@ -221,7 +232,23 @@ def verify_liveness(payload: VerifyLivenessRequest) -> VerifyLivenessResponse:
         raise HTTPException(status_code=404, detail="基准人脸不存在，请重新上传")
 
     challenge.verified_at = datetime.now(timezone.utc)
-    evaluation = _evaluate_liveness_frames(payload.frames, challenge.actions, enrollment.embedding, settings)
+    validate_timing = (
+        settings.liveness_timing_jitter_enabled
+        and payload.timing_nonce is not None
+        and payload.timing_nonce == challenge.timing_nonce
+    )
+    if settings.liveness_timing_jitter_required and not validate_timing:
+        raise HTTPException(status_code=400, detail="缺少动作时序校验信息，请升级客户端后重试")
+
+    with _VerificationSlot():
+        evaluation = _evaluate_liveness_frames(
+            payload.frames,
+            challenge.actions,
+            enrollment.embedding,
+            settings,
+            expected_capture_delays_ms=challenge.capture_delays_ms,
+            validate_capture_timing=validate_timing,
+        )
 
     challenge.liveness_passed = evaluation.passed
     challenge.live_embedding = evaluation.live_embedding if evaluation.passed else None
@@ -320,14 +347,17 @@ def create_template(
         raise HTTPException(status_code=400, detail=f"基准人脸姿态不达标：{pose_quality['detail']}")
 
     source_hash = hashlib.sha256(payload.image.encode("utf-8")).hexdigest()
-    template = store.create_template(
-        subject_type=payload.subject_type,
-        subject_id=payload.subject_id,
-        embedding=face.embedding,
-        bbox=face.bbox,
-        source_type=payload.source_type,
-        source_image_hash=source_hash,
-    )
+    try:
+        template = store.create_template(
+            subject_type=payload.subject_type,
+            subject_id=payload.subject_id,
+            embedding=face.embedding,
+            bbox=face.bbox,
+            source_type=payload.source_type,
+            source_image_hash=source_hash,
+        )
+    except TemplateCryptoError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return TemplateCreateResponse(
         template_id=template.template_id,
         template_version=template.template_version,
@@ -348,7 +378,10 @@ def list_subject_templates(
     subject_id: str,
     _authorized: bool = Depends(_require_internal_api_key),
 ) -> TemplateListResponse:
-    templates = store.list_templates(subject_type, subject_id)
+    try:
+        templates = store.list_templates(subject_type, subject_id)
+    except TemplateCryptoError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     active = next((item for item in templates if item.status == "active"), None)
     return TemplateListResponse(
         subject_type=subject_type,
@@ -379,19 +412,30 @@ def create_verification_session(
     payload: VerificationSessionCreateRequest,
     _authorized: bool = Depends(_require_internal_api_key),
 ) -> VerificationSessionCreateResponse:
-    actions = random_actions(settings.liveness_action_min_count, settings.liveness_action_max_count)
-    session = store.create_verification_session(
-        request_id=payload.request_id,
-        subject_type=payload.subject_type,
-        subject_id=payload.subject_id,
-        admin_id=payload.admin_id,
-        scene=payload.scene,
-        business_event_id=payload.business_event_id,
-        record_id=payload.record_id,
-        action=payload.action,
-        expected_actions=actions,
-        ttl_seconds=settings.verification_session_ttl_seconds,
+    actions = _select_liveness_actions(
+        settings,
+        payload.subject_type,
+        payload.subject_id,
+        payload.scene,
     )
+    capture_delays_ms, timing_nonce = _create_capture_timing_plan(actions, settings)
+    try:
+        session = store.create_verification_session(
+            request_id=payload.request_id,
+            subject_type=payload.subject_type,
+            subject_id=payload.subject_id,
+            admin_id=payload.admin_id,
+            scene=payload.scene,
+            business_event_id=payload.business_event_id,
+            record_id=payload.record_id,
+            action=payload.action,
+            expected_actions=actions,
+            ttl_seconds=settings.verification_session_ttl_seconds,
+            capture_delays_ms=capture_delays_ms,
+            timing_nonce=timing_nonce,
+        )
+    except TemplateCryptoError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if session is None:
         raise HTTPException(status_code=404, detail="未找到有效人脸模板，请先登记基准人脸")
 
@@ -401,6 +445,8 @@ def create_verification_session(
         upload_token=session.upload_token,
         actions=session.expected_actions,
         labels=ACTION_LABELS,
+        capture_delays_ms=session.capture_delays_ms,
+        timing_nonce=session.timing_nonce,
         expires_at=session.expires_at,
     )
 
@@ -412,6 +458,7 @@ def create_verification_session(
 def verify_verification_session(
     session_id: str,
     payload: VerificationSessionVerifyRequest,
+    request: Request,
     authorization: Optional[str] = Header(default=None),
 ) -> VerificationSessionVerifyResponse:
     store.recover_stale_session_verification(
@@ -431,22 +478,38 @@ def verify_verification_session(
     if not upload_token or not store.verify_upload_token(session_id, upload_token):
         raise HTTPException(status_code=401, detail="上传令牌无效")
 
-    template = store.get_template(session.template_id)
+    try:
+        template = store.get_template(session.template_id)
+    except TemplateCryptoError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if template is None or template.status != "active":
         store.mark_session_failed(session_id, "FAIL_TEMPLATE_INVALID")
         raise HTTPException(status_code=409, detail="人脸模板无效，请重新登记")
+
+    failure_key = _failure_limit_key(session, _client_ip(request))
+    _raise_if_failure_limited(failure_key, settings)
 
     verification_attempt = store.start_session_verification(session_id)
     if not verification_attempt:
         raise HTTPException(status_code=409, detail="核验会话已使用，请重新发起")
 
     try:
-        evaluation = _evaluate_liveness_frames(
-            payload.frames,
-            session.expected_actions,
-            template.embedding,
-            settings,
+        validate_timing = (
+            settings.liveness_timing_jitter_enabled
+            and payload.timing_nonce is not None
+            and payload.timing_nonce == session.timing_nonce
         )
+        if settings.liveness_timing_jitter_required and not validate_timing:
+            raise HTTPException(status_code=400, detail="缺少动作时序校验信息，请升级客户端后重试")
+        with _VerificationSlot():
+            evaluation = _evaluate_liveness_frames(
+                payload.frames,
+                session.expected_actions,
+                template.embedding,
+                settings,
+                expected_capture_delays_ms=session.capture_delays_ms,
+                validate_capture_timing=validate_timing,
+            )
     except HTTPException as exc:
         result_code = _result_code_from_exception(exc)
         if result_code == "ERROR_MODEL_UNAVAILABLE":
@@ -477,6 +540,7 @@ def verify_verification_session(
             verification_attempt,
             action_results=evaluation.action_results,
         )
+    _record_failure_limit_result(failure_key, evaluation.passed, settings)
 
     return VerificationSessionVerifyResponse(
         session_id=session_id,
@@ -581,7 +645,175 @@ def _result_code_from_exception(exc: HTTPException) -> str:
         return "EXPIRED_SESSION"
     if exc.status_code == 503:
         return "ERROR_MODEL_UNAVAILABLE"
+    if exc.status_code == 429:
+        return "RATE_LIMITED"
     return "FAIL_PROTOCOL"
+
+
+def _action_weights_from_settings(settings: Settings) -> dict:
+    weights = {}
+    for item in settings.liveness_action_weights.split(","):
+        if "=" not in item:
+            continue
+        action, value = item.split("=", 1)
+        action = action.strip()
+        if action not in ACTION_LABELS:
+            continue
+        try:
+            weights[action] = max(float(value), 0.05)
+        except ValueError:
+            continue
+    return weights
+
+
+def _recent_actions_to_reduce(subject_type: str, subject_id: str, scene: str, settings: Settings) -> set:
+    window = max(0, settings.liveness_action_recent_failure_window)
+    if window < 2:
+        return set()
+    failed = store.recent_failed_action_names(subject_type, subject_id, scene, window)
+    if len(failed) < window:
+        return set()
+    first = failed[0]
+    if first and all(action == first for action in failed[:window]):
+        return {first}
+    return set()
+
+
+def _select_liveness_actions(
+    settings: Settings,
+    subject_type: Optional[str] = None,
+    subject_id: Optional[str] = None,
+    scene: Optional[str] = None,
+) -> list:
+    reduced = set()
+    if subject_type and subject_id and scene:
+        reduced = _recent_actions_to_reduce(subject_type, subject_id, scene, settings)
+    return random_actions(
+        settings.liveness_action_min_count,
+        settings.liveness_action_max_count,
+        weights=_action_weights_from_settings(settings),
+        reduced_actions=reduced,
+        reduction_factor=settings.liveness_action_recent_failure_factor,
+    )
+
+
+def _create_capture_timing_plan(actions: list, settings: Settings) -> tuple[list, Optional[str]]:
+    if not settings.liveness_timing_jitter_enabled:
+        return [], None
+    min_delay = max(0, settings.liveness_timing_min_delay_ms)
+    max_delay = max(min_delay, settings.liveness_timing_max_delay_ms)
+    delays = [
+        min_delay + secrets.randbelow(max_delay - min_delay + 1)
+        for _ in actions
+    ]
+    return delays, secrets.token_urlsafe(16)
+
+
+def _validate_capture_timing(
+    frames: list,
+    expected_actions: list,
+    expected_delays_ms: list,
+    settings: Settings,
+) -> Optional[dict]:
+    if not expected_actions or not expected_delays_ms:
+        return None
+    frames_by_action = defaultdict(list)
+    for frame in frames:
+        frames_by_action[frame.action].append(frame)
+    tolerance = max(0, settings.liveness_timing_tolerance_ms)
+    gaps = []
+    for index in range(1, len(expected_actions)):
+        action = expected_actions[index]
+        previous = expected_actions[index - 1]
+        current_frames = frames_by_action.get(action, [])
+        previous_frames = frames_by_action.get(previous, [])
+        if not current_frames or not previous_frames:
+            continue
+        gap = float(current_frames[0].timestamp) - float(previous_frames[-1].timestamp)
+        expected = int(expected_delays_ms[index]) if index < len(expected_delays_ms) else 0
+        gaps.append((action, gap, expected))
+        if gap + tolerance < expected:
+            return {
+                "action": "capture_timing",
+                "label": "动作时序",
+                "passed": False,
+                "score": round(gap, 1),
+                "detail": (
+                    f"{ACTION_LABELS.get(action, action)} 开始过快："
+                    f"gap={gap:.0f}ms, expected>={expected}ms, tolerance={tolerance}ms"
+                ),
+            }
+    if not gaps:
+        return None
+    min_gap = min(item[1] for item in gaps)
+    return {
+        "action": "capture_timing",
+        "label": "动作时序",
+        "passed": True,
+        "score": round(min_gap, 1),
+        "detail": "；".join(
+            f"{ACTION_LABELS.get(action, action)} gap={gap:.0f}ms/expected={expected}ms"
+            for action, gap, expected in gaps
+        ),
+    }
+
+
+def _failure_limit_key(session, client_ip: str) -> str:
+    return "|".join([
+        session.subject_type,
+        session.subject_id,
+        session.scene,
+        client_ip or "unknown",
+    ])
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _raise_if_failure_limited(key: str, settings: Settings) -> None:
+    if not settings.verification_failure_limit_enabled:
+        return
+    retry_after = failure_limiter.retry_after_seconds(key)
+    if retry_after > 0:
+        raise HTTPException(
+            status_code=429,
+            detail="尝试次数较多，请稍后再试",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def _record_failure_limit_result(key: str, passed: bool, settings: Settings) -> None:
+    if not settings.verification_failure_limit_enabled:
+        return
+    if passed:
+        failure_limiter.clear(key)
+        return
+    failure_limiter.record_failure(
+        key,
+        settings.verification_failure_max_attempts,
+        settings.verification_failure_window_seconds,
+        settings.verification_failure_cooldown_seconds,
+    )
+
+
+class _VerificationSlot:
+    def __enter__(self):
+        acquired = verification_semaphore.acquire(blocking=False)
+        if not acquired:
+            raise HTTPException(
+                status_code=503,
+                detail="当前人脸核验请求较多，请稍后重试",
+                headers={"Retry-After": "3"},
+            )
+        return self
+
+    def __exit__(self, *_args):
+        verification_semaphore.release()
+        return False
 
 
 def _evaluate_liveness_frames(
@@ -589,8 +821,31 @@ def _evaluate_liveness_frames(
     expected_actions: list,
     reference_embedding: np.ndarray,
     settings: Settings,
+    expected_capture_delays_ms: Optional[list] = None,
+    validate_capture_timing: bool = False,
 ) -> VerificationEvaluation:
     _validate_frame_sequence(frames, expected_actions, settings)
+    timing_result = None
+    if validate_capture_timing:
+        timing_result = _validate_capture_timing(
+            frames,
+            expected_actions,
+            expected_capture_delays_ms or [],
+            settings,
+        )
+        if timing_result and not timing_result["passed"]:
+            return VerificationEvaluation(
+                passed=False,
+                result_code="FAIL_TIMING",
+                anti_spoofing_passed=False,
+                anti_spoofing_score=0.0,
+                face_matched=False,
+                similarity=None,
+                threshold=settings.face_match_threshold,
+                action_results=[timing_result],
+                live_embedding=None,
+                message="动作时序异常，请按提示重新验证",
+            )
 
     frames_by_action = defaultdict(list)
     all_frames = []
@@ -608,6 +863,8 @@ def _evaluate_liveness_frames(
         raise HTTPException(status_code=400, detail="没有收到有效动作帧")
 
     action_results = []
+    if timing_result:
+        action_results.append(timing_result)
     image_quality = _validate_sampled_image_quality(all_frames, settings, "图像质量")
     action_results.append(image_quality)
     if not image_quality["passed"]:

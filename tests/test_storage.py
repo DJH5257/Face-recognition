@@ -5,10 +5,66 @@ from pathlib import Path
 
 import numpy as np
 
+from backend.app.config import get_settings
 from backend.app.stores import MemoryStore
+from backend.app.template_crypto import TemplateCryptoError, is_encrypted_blob
 
 
 class ProductionStorageTests(unittest.TestCase):
+    def test_template_embedding_is_encrypted_when_key_is_configured(self):
+        settings = get_settings()
+        original_key = settings.template_encryption_key
+        original_required = settings.template_encryption_required
+        settings.template_encryption_key = "unit-test-template-encryption-key"
+        settings.template_encryption_required = True
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                db_path = Path(tmp_dir) / "face.sqlite3"
+                store = MemoryStore(db_path)
+                template = store.create_template(
+                    subject_type="doctor",
+                    subject_id="83",
+                    embedding=np.array([1.0, 0.0], dtype=np.float32),
+                    bbox=[0, 0, 10, 10],
+                    source_type="avatar",
+                    source_image_hash="hash-a",
+                )
+                with store._connect() as conn:
+                    row = conn.execute(
+                        "SELECT embedding_blob FROM face_templates WHERE template_id = ?",
+                        (template.template_id,),
+                    ).fetchone()
+
+                self.assertTrue(is_encrypted_blob(row["embedding_blob"]))
+                reopened = MemoryStore(db_path)
+                loaded = reopened.get_template(template.template_id)
+                np.testing.assert_allclose(loaded.embedding, np.array([1.0, 0.0], dtype=np.float32))
+        finally:
+            settings.template_encryption_key = original_key
+            settings.template_encryption_required = original_required
+
+    def test_template_encryption_required_rejects_missing_key(self):
+        settings = get_settings()
+        original_key = settings.template_encryption_key
+        original_required = settings.template_encryption_required
+        settings.template_encryption_key = ""
+        settings.template_encryption_required = True
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                store = MemoryStore(Path(tmp_dir) / "face.sqlite3")
+                with self.assertRaises(TemplateCryptoError):
+                    store.create_template(
+                        subject_type="doctor",
+                        subject_id="83",
+                        embedding=np.array([1.0, 0.0], dtype=np.float32),
+                        bbox=[0, 0, 10, 10],
+                        source_type="avatar",
+                        source_image_hash="hash-a",
+                    )
+        finally:
+            settings.template_encryption_key = original_key
+            settings.template_encryption_required = original_required
+
     def test_template_versions_persist_and_only_latest_is_active(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = Path(tmp_dir) / "face.sqlite3"
@@ -219,6 +275,46 @@ class ProductionStorageTests(unittest.TestCase):
 
             self.assertEqual(store.get_session(pass_session.session_id).action_results, pass_results)
             self.assertEqual(store.get_session(fail_session.session_id).action_results, fail_results)
+
+    def test_recent_failed_action_names_reads_action_results(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = MemoryStore(Path(tmp_dir) / "face.sqlite3")
+            store.create_template(
+                subject_type="doctor",
+                subject_id="83",
+                embedding=np.array([1.0, 0.0], dtype=np.float32),
+                bbox=[0, 0, 1, 1],
+                source_type="avatar",
+                source_image_hash="hash",
+            )
+            for index in range(2):
+                session = store.create_verification_session(
+                    request_id=f"event-{index}",
+                    subject_type="doctor",
+                    subject_id="83",
+                    admin_id=None,
+                    scene="login",
+                    business_event_id=f"biz-{index}",
+                    record_id=None,
+                    action="login",
+                    expected_actions=["blink"],
+                    ttl_seconds=180,
+                )
+                attempt = store.start_session_verification(session.session_id)
+                store.mark_session_failed(
+                    session.session_id,
+                    "FAIL_ACTION",
+                    verifying_started_at=attempt,
+                    action_results=[
+                        {"action": "blink", "passed": False, "score": 0.1, "detail": "low"},
+                        {"action": "face_match", "passed": True, "score": 1.0, "detail": "ok"},
+                    ],
+                )
+
+            self.assertEqual(
+                store.recent_failed_action_names("doctor", "83", "login", 2),
+                ["blink", "blink"],
+            )
 
     def test_proof_requires_current_verifying_attempt(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

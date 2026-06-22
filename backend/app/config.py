@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     verification_session_ttl_seconds: int = 300
     verification_processing_timeout_seconds: int = 90
     proof_ttl_seconds: int = 300
+    template_encryption_key: str = ""
+    template_encryption_required: bool = False
 
     insightface_model: str = "buffalo_l"
     insightface_root: str = "~/.insightface"
@@ -55,6 +57,12 @@ class Settings(BaseSettings):
     anti_spoofing_sample_frames: int = 6
     anti_spoofing_max_concurrent_inferences: int = 2
 
+    verification_max_concurrent_requests: int = 4
+    verification_failure_limit_enabled: bool = True
+    verification_failure_max_attempts: int = 5
+    verification_failure_window_seconds: int = 300
+    verification_failure_cooldown_seconds: int = 180
+
     image_quality_sample_frames: int = 6
     image_quality_min_laplacian: float = 12.0
     image_quality_min_brightness: float = 35.0
@@ -67,6 +75,15 @@ class Settings(BaseSettings):
     image_quality_template_max_abs_pitch: float = 35.0
     image_quality_live_max_abs_yaw: float = 55.0
     image_quality_live_max_abs_pitch: float = 55.0
+
+    liveness_action_weights: str = "mouth_open=24,shake_head=24,nod_head=24,blink=18,smile=18"
+    liveness_action_recent_failure_window: int = 2
+    liveness_action_recent_failure_factor: float = 0.5
+    liveness_timing_jitter_enabled: bool = True
+    liveness_timing_jitter_required: bool = False
+    liveness_timing_min_delay_ms: int = 150
+    liveness_timing_max_delay_ms: int = 450
+    liveness_timing_tolerance_ms: int = 180
 
     max_upload_bytes: int = 8 * 1024 * 1024
     max_frame_base64_chars: int = 768 * 1024

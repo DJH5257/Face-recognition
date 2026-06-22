@@ -15,6 +15,7 @@ from backend.app.main import (
     _analyze_live_faces,
     _fold_abs_pose_angle,
     _match_live_face,
+    _validate_capture_timing,
     _validate_face_bbox_quality,
     _select_deep_check_frames,
     _select_pose_quality_frames,
@@ -117,6 +118,37 @@ class VerificationGuardTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("帧序号不连续", ctx.exception.detail)
+
+    def test_capture_timing_rejects_too_fast_action_switch(self):
+        frames = [
+            *[make_frame("blink", index, index * 200) for index in range(11)],
+            *[make_frame("mouth_open", index, 2050 + index * 200) for index in range(11)],
+        ]
+
+        result = _validate_capture_timing(
+            frames,
+            ["blink", "mouth_open"],
+            [200, 500],
+            Settings(liveness_timing_tolerance_ms=100),
+        )
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["action"], "capture_timing")
+
+    def test_capture_timing_accepts_expected_action_switch(self):
+        frames = [
+            *[make_frame("blink", index, index * 200) for index in range(11)],
+            *[make_frame("mouth_open", index, 2450 + index * 200) for index in range(11)],
+        ]
+
+        result = _validate_capture_timing(
+            frames,
+            ["blink", "mouth_open"],
+            [200, 500],
+            Settings(liveness_timing_tolerance_ms=100),
+        )
+
+        self.assertTrue(result["passed"], result["detail"])
 
     def test_frame_uniqueness_rejects_repeated_frames(self):
         frame = np.full((32, 32, 3), 128, dtype=np.uint8)

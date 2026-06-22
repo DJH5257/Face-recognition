@@ -23,6 +23,8 @@ class ChallengeResponse(BaseModel):
     challenge_id: str
     actions: List[str]
     labels: Dict[str, str]
+    capture_delays_ms: List[int] = Field(default_factory=list)
+    timing_nonce: Optional[str] = None
 
 
 class FramePayload(BaseModel):
@@ -43,6 +45,7 @@ class VerifyLivenessRequest(BaseModel):
 
     challenge_id: str
     enrollment_id: Optional[str] = None
+    timing_nonce: Optional[str] = Field(default=None, max_length=128)
     frames: List[FramePayload] = Field(..., min_length=1, max_length=MAX_VERIFY_FRAMES)
 
 
@@ -150,12 +153,15 @@ class VerificationSessionCreateResponse(BaseModel):
     upload_token: str
     actions: List[str]
     labels: Dict[str, str]
+    capture_delays_ms: List[int] = Field(default_factory=list)
+    timing_nonce: Optional[str] = None
     expires_at: datetime
 
 
 class VerificationSessionVerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    timing_nonce: Optional[str] = Field(default=None, max_length=128)
     frames: List[FramePayload] = Field(..., min_length=1, max_length=MAX_VERIFY_FRAMES)
 
 

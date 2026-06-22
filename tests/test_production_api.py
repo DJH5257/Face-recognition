@@ -3,12 +3,14 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
 from fastapi import BackgroundTasks, HTTPException
 
 from backend.app import main
+from backend.app.rate_limit import InMemoryFailureLimiter
 from backend.app.schemas import (
     FramePayload,
     ProofFinalizeRequest,
@@ -69,17 +71,29 @@ def fake_quality(*_args, **_kwargs):
     }
 
 
+def fake_request(host="127.0.0.1"):
+    return SimpleNamespace(headers={}, client=SimpleNamespace(host=host))
+
+
 class ProductionApiTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.original_store = main.store
         self.original_key = main.settings.internal_api_key
         self.original_insightface_root = main.settings.insightface_root
+        self.original_failure_max_attempts = main.settings.verification_failure_max_attempts
+        self.original_failure_window_seconds = main.settings.verification_failure_window_seconds
+        self.original_failure_cooldown_seconds = main.settings.verification_failure_cooldown_seconds
         self.original_face_engine = main.face_engine
         self.original_evaluate = main._evaluate_liveness_frames
         self.original_pose_quality = main._validate_pose_quality
+        self.original_failure_limiter = main.failure_limiter
         main.store = MemoryStore(Path(self.tmp.name) / "face.sqlite3")
+        main.failure_limiter = InMemoryFailureLimiter()
         main.settings.internal_api_key = "test-key"
+        main.settings.verification_failure_max_attempts = 5
+        main.settings.verification_failure_window_seconds = 300
+        main.settings.verification_failure_cooldown_seconds = 180
         insightface_root = Path(self.tmp.name) / "insightface-home" / ".insightface"
         model_dir = insightface_root / "models" / main.settings.insightface_model
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -99,9 +113,13 @@ class ProductionApiTests(unittest.TestCase):
         main.store = self.original_store
         main.settings.internal_api_key = self.original_key
         main.settings.insightface_root = self.original_insightface_root
+        main.settings.verification_failure_max_attempts = self.original_failure_max_attempts
+        main.settings.verification_failure_window_seconds = self.original_failure_window_seconds
+        main.settings.verification_failure_cooldown_seconds = self.original_failure_cooldown_seconds
         main.face_engine = self.original_face_engine
         main._evaluate_liveness_frames = self.original_evaluate
         main._validate_pose_quality = self.original_pose_quality
+        main.failure_limiter = self.original_failure_limiter
         self.tmp.cleanup()
 
     def test_internal_routes_require_api_key(self):
@@ -155,6 +173,7 @@ class ProductionApiTests(unittest.TestCase):
             main.verify_verification_session(
                 first_session.session_id,
                 make_verify_request(),
+                request=fake_request(),
                 authorization="Bearer wrong-token",
             )
         self.assertEqual(wrong_token.exception.status_code, 401)
@@ -185,6 +204,7 @@ class ProductionApiTests(unittest.TestCase):
         verify_response = main.verify_verification_session(
             first_session.session_id,
             make_verify_request(),
+            request=fake_request(),
             authorization=f"Bearer {first_session.upload_token}",
         )
         self.assertTrue(verify_response.passed)
@@ -195,6 +215,7 @@ class ProductionApiTests(unittest.TestCase):
             main.verify_verification_session(
                 first_session.session_id,
                 make_verify_request(),
+                request=fake_request(),
                 authorization=f"Bearer {first_session.upload_token}",
             )
         self.assertEqual(replay.exception.status_code, 409)
@@ -290,12 +311,85 @@ class ProductionApiTests(unittest.TestCase):
         response = main.verify_verification_session(
             session.session_id,
             make_verify_request(),
+            request=fake_request(),
             authorization=f"Bearer {session.upload_token}",
         )
 
         self.assertFalse(response.passed)
         self.assertEqual(response.result_code, "FAIL_FACE_MISMATCH")
         self.assertIsNone(response.proof_id)
+
+    def test_repeated_failures_are_rate_limited_by_subject_and_ip(self):
+        main.settings.verification_failure_max_attempts = 2
+        main.settings.verification_failure_window_seconds = 300
+        main.settings.verification_failure_cooldown_seconds = 60
+        main.create_template(
+            TemplateCreateRequest(
+                subject_type="doctor",
+                subject_id="86",
+                image=make_image_payload(),
+            )
+        )
+
+        def fake_fail(*_args, **_kwargs):
+            return main.VerificationEvaluation(
+                passed=False,
+                result_code="FAIL_FACE_MISMATCH",
+                anti_spoofing_passed=True,
+                anti_spoofing_score=0.9,
+                face_matched=False,
+                similarity=0.12,
+                threshold=main.settings.face_match_threshold,
+                action_results=[
+                    {
+                        "action": "face_match",
+                        "label": "人脸一致性",
+                        "passed": False,
+                        "score": 0.12,
+                        "detail": "mock mismatch",
+                    }
+                ],
+                live_embedding=None,
+                message="人脸比对失败，不是同一个人",
+            )
+
+        main._evaluate_liveness_frames = fake_fail
+        for index in range(2):
+            session = main.create_verification_session(
+                BackgroundTasks(),
+                VerificationSessionCreateRequest(
+                    subject_type="doctor",
+                    subject_id="86",
+                    scene="login",
+                    business_event_id=f"biz-limit-{index}",
+                ),
+            )
+            response = main.verify_verification_session(
+                session.session_id,
+                make_verify_request(),
+                request=fake_request("10.0.0.8"),
+                authorization=f"Bearer {session.upload_token}",
+            )
+            self.assertFalse(response.passed)
+
+        limited = main.create_verification_session(
+            BackgroundTasks(),
+            VerificationSessionCreateRequest(
+                subject_type="doctor",
+                subject_id="86",
+                scene="login",
+                business_event_id="biz-limit-2",
+            ),
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            main.verify_verification_session(
+                limited.session_id,
+                make_verify_request(),
+                request=fake_request("10.0.0.8"),
+                authorization=f"Bearer {limited.upload_token}",
+            )
+
+        self.assertEqual(ctx.exception.status_code, 429)
 
     def test_verify_route_recovers_stale_verifying_session(self):
         main.create_template(
@@ -341,6 +435,7 @@ class ProductionApiTests(unittest.TestCase):
         response = main.verify_verification_session(
             session.session_id,
             make_verify_request(),
+            request=fake_request(),
             authorization=f"Bearer {session.upload_token}",
         )
 

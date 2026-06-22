@@ -3,6 +3,8 @@ const state = {
   challengeId: null,
   actions: [],
   labels: {},
+  captureDelaysMs: [],
+  timingNonce: null,
   stream: null,
   cameraReady: false,
   isUploading: false,
@@ -26,6 +28,13 @@ const CAPTURE_JPEG_QUALITY = 0.7;
 const ACTION_SWITCH_PAUSE_MS = 250;
 const REQUEST_TIMEOUT_MS = 20000;
 const VERIFY_TIMEOUT_MS = 90000;
+const ACTION_GUIDANCE = Object.freeze({
+  blink: "睁眼看镜头 -> 眨一下 -> 再睁开",
+  smile: "嘴角明显上扬或露齿",
+  nod_head: "低头再抬头",
+  shake_head: "向左看 -> 向右看",
+  mouth_open: "明显张嘴后闭合",
+});
 
 const $ = (id) => document.getElementById(id);
 
@@ -210,6 +219,8 @@ els.challengeBtn.addEventListener("click", async () => {
     state.challengeId = data.challenge_id;
     state.actions = Array.isArray(data.actions) ? data.actions : [];
     state.labels = data.labels || {};
+    state.captureDelaysMs = Array.isArray(data.capture_delays_ms) ? data.capture_delays_ms : [];
+    state.timingNonce = data.timing_nonce || null;
     els.actionsText.textContent = formatActionsText();
     els.livenessText.textContent = "待检测";
     els.livenessText.className = "";
@@ -252,11 +263,15 @@ els.captureBtn.addEventListener("click", async () => {
       if (actionIndex === 0) {
         await countdown(`${label}，准备`, 1);
       }
-      els.instruction.textContent = `${label}，采集中 ${actionIndex + 1}/${state.actions.length}`;
       if (actionIndex > 0) {
         await sleep(ACTION_SWITCH_PAUSE_MS);
       }
-      const captured = await captureFramesForAction(action);
+      const delayMs = Math.max(0, Number(state.captureDelaysMs[actionIndex] || 0));
+      if (delayMs > 0) {
+        els.instruction.textContent = `${label}，准备动作 ${actionIndex + 1}/${state.actions.length}`;
+        await sleep(delayMs);
+      }
+      const captured = await captureFramesForAction(action, actionIndex, state.actions.length, label);
       frames.push(...captured);
     }
     els.instruction.textContent = "正在提交检测";
@@ -266,6 +281,7 @@ els.captureBtn.addEventListener("click", async () => {
       body: JSON.stringify({
         challenge_id: state.challengeId,
         enrollment_id: state.enrollmentId,
+        timing_nonce: state.timingNonce,
         frames,
       }),
       timeoutMs: VERIFY_TIMEOUT_MS,
@@ -292,11 +308,12 @@ els.captureBtn.addEventListener("click", async () => {
   }
 });
 
-async function captureFramesForAction(action) {
+async function captureFramesForAction(action, actionIndex, totalActions, label) {
   const frames = [];
   const started = performance.now();
   const intervalMs = captureIntervalForAction(action);
   const frameCount = Math.max(2, Math.ceil(CAPTURE_DURATION_MS / intervalMs) + 1);
+  const guidance = ACTION_GUIDANCE[action] || label;
 
   for (let index = 0; index < frameCount; index += 1) {
     const scheduledAt = started + Math.min(index * intervalMs, CAPTURE_DURATION_MS);
@@ -311,6 +328,9 @@ async function captureFramesForAction(action) {
       timestamp: Math.round(performance.now()),
       image: captureJpegDataUrl(),
     });
+    const percent = Math.min(100, Math.round((index / Math.max(frameCount - 1, 1)) * 100));
+    els.instruction.textContent =
+      `${label} ${actionIndex + 1}/${totalActions}：${guidance}，进度 ${percent}%`;
   }
   return frames;
 }
@@ -410,6 +430,8 @@ function clearChallenge() {
   state.challengeId = null;
   state.actions = [];
   state.labels = {};
+  state.captureDelaysMs = [];
+  state.timingNonce = null;
   els.actionsText.textContent = "-";
   els.livenessText.textContent = "未检测";
   els.livenessText.className = "";
@@ -422,6 +444,8 @@ function finishChallengeCycle() {
   state.challengeId = null;
   state.actions = [];
   state.labels = {};
+  state.captureDelaysMs = [];
+  state.timingNonce = null;
   els.actionsText.textContent = "请重新生成动作";
 }
 

@@ -106,13 +106,23 @@ FACE_DEMO_INTERNAL_API_KEY=change-me-face-internal-key
 FACE_DEMO_CORS_ORIGINS=*
 FACE_DEMO_VERIFICATION_SESSION_TTL_SECONDS=300
 FACE_DEMO_PROOF_TTL_SECONDS=300
+FACE_DEMO_TEMPLATE_ENCRYPTION_KEY=
+FACE_DEMO_TEMPLATE_ENCRYPTION_REQUIRED=0
 FACE_DEMO_INSIGHTFACE_MODEL=buffalo_l
 FACE_DEMO_INSIGHTFACE_ROOT=/opt/face-verify-demo/shared/insightface-home/.insightface
 FACE_DEMO_INSIGHTFACE_DET_SIZE=480
 FACE_DEMO_INSIGHTFACE_LIVE_DET_SIZE=320
 FACE_DEMO_FACE_MATCH_EMBEDDING_SAMPLE=5
+FACE_DEMO_VERIFICATION_MAX_CONCURRENT_REQUESTS=4
+FACE_DEMO_VERIFICATION_FAILURE_LIMIT_ENABLED=1
+FACE_DEMO_VERIFICATION_FAILURE_MAX_ATTEMPTS=5
+FACE_DEMO_VERIFICATION_FAILURE_WINDOW_SECONDS=300
+FACE_DEMO_VERIFICATION_FAILURE_COOLDOWN_SECONDS=180
 FACE_DEMO_LIVENESS_ACTION_MIN_COUNT=1
 FACE_DEMO_LIVENESS_ACTION_MAX_COUNT=3
+FACE_DEMO_LIVENESS_ACTION_WEIGHTS=mouth_open=24,shake_head=24,nod_head=24,blink=18,smile=18
+FACE_DEMO_LIVENESS_TIMING_JITTER_ENABLED=1
+FACE_DEMO_LIVENESS_TIMING_JITTER_REQUIRED=0
 FACE_DEMO_MIN_FRAMES_PER_ACTION=6
 FACE_DEMO_MAX_FRAMES_PER_ACTION=32
 FACE_DEMO_MAX_TOTAL_FRAMES=90
@@ -135,6 +145,8 @@ FACE_DEMO_ANTI_SPOOFING_MODEL_PATH=models/MiniFASNetV1SE.onnx,models/MiniFASNetV
 ```
 
 阈值需要用你的摄像头、光照、真人样本、照片、屏幕、视频回放和低性能设备重新校准。图像质量门禁会先拦截明显模糊、过暗、过曝、低对比度、脸过小、脸框明显越界或姿态明显偏转的登记照和活体抽样帧，避免烂图污染模板或进入重模型推理。
+
+生产环境建议设置 `FACE_DEMO_TEMPLATE_ENCRYPTION_KEY` 并开启 `FACE_DEMO_TEMPLATE_ENCRYPTION_REQUIRED=1`，这样新登记的人脸 embedding 会加密落库。旧明文模板仍可兼容读取，确认密钥配置无误后再逐步迁移。失败次数限制和验证并发保护为进程内实现，单机可以防止异常重试拖垮服务，多实例场景需要在网关层配合限流。
 
 ## 生产部署建议
 
@@ -259,7 +271,7 @@ X-Face-Api-Key: ...
 }
 ```
 
-服务端生成 1-3 个随机动作、绑定 active 模板并返回 `session_id`、`upload_token`、`actions` 和 `expires_at`。相同 `request_id` 会返回同一会话。
+服务端按权重生成 1-3 个随机动作、绑定 active 模板并返回 `session_id`、`upload_token`、`actions`、`capture_delays_ms`、`timing_nonce` 和 `expires_at`。相同 `request_id` 会返回同一会话。新客户端应在动作采集前按 `capture_delays_ms` 做短随机等待，并在提交帧时原样回传 `timing_nonce`；旧客户端不回传时默认仍兼容，除非开启 `FACE_DEMO_LIVENESS_TIMING_JITTER_REQUIRED=1`。
 
 ### 生产：提交连续帧核验
 
@@ -271,6 +283,7 @@ Content-Type: application/json
 
 ```json
 {
+  "timing_nonce": "...",
   "frames": [
     {
       "action": "blink",
@@ -323,6 +336,8 @@ Content-Type: application/json
 {
   "challenge_id": "...",
   "actions": ["blink", "mouth_open", "shake_head"],
+  "capture_delays_ms": [220, 410, 180],
+  "timing_nonce": "...",
   "labels": {
     "blink": "请眨眼",
     "mouth_open": "请张嘴"
@@ -341,6 +356,7 @@ Content-Type: application/json
 {
   "challenge_id": "...",
   "enrollment_id": "...",
+  "timing_nonce": "...",
   "frames": [
     {
       "action": "blink",

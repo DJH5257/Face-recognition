@@ -14,6 +14,7 @@ from uuid import uuid4
 import numpy as np
 
 from .config import get_settings
+from .template_crypto import TemplateCryptoError, embedding_from_blob, embedding_to_blob, is_encrypted_blob
 
 
 def _utcnow() -> datetime:
@@ -36,14 +37,21 @@ def _from_iso(value: Optional[str]) -> Optional[datetime]:
 
 
 def _embedding_to_blob(embedding: np.ndarray) -> tuple[bytes, int]:
-    normalized = np.asarray(embedding, dtype=np.float32)
-    return normalized.tobytes(), int(normalized.size)
+    settings = get_settings()
+    return embedding_to_blob(
+        embedding,
+        settings.template_encryption_key,
+        settings.template_encryption_required,
+    )
 
 
 def _embedding_from_blob(blob: bytes, dimension: int) -> np.ndarray:
-    embedding = np.frombuffer(blob, dtype=np.float32, count=dimension).copy()
-    norm = max(float(np.linalg.norm(embedding)), 1e-12)
-    return (embedding / norm).astype(np.float32)
+    settings = get_settings()
+    return embedding_from_blob(blob, dimension, settings.template_encryption_key)
+
+
+def _template_blob_is_encrypted(blob: bytes) -> bool:
+    return is_encrypted_blob(blob)
 
 
 def _token_hash(value: str) -> str:
@@ -99,6 +107,8 @@ class Challenge:
     id: str
     actions: List[str]
     expires_at: datetime
+    capture_delays_ms: List[int] = field(default_factory=list)
+    timing_nonce: Optional[str] = None
     enrollment_id: Optional[str] = None
     liveness_passed: bool = False
     live_embedding: Optional[np.ndarray] = None
@@ -142,6 +152,8 @@ class VerificationSession:
     template_id: str
     template_version: int
     expected_actions: List[str]
+    capture_delays_ms: List[int]
+    timing_nonce: Optional[str]
     upload_token: str
     status: str
     result_code: str
@@ -207,11 +219,15 @@ class Store:
         actions: List[str],
         ttl_seconds: int,
         enrollment_id: Optional[str] = None,
+        capture_delays_ms: Optional[List[int]] = None,
+        timing_nonce: Optional[str] = None,
     ) -> Challenge:
         item = Challenge(
             id=str(uuid4()),
             actions=actions,
             enrollment_id=enrollment_id,
+            capture_delays_ms=list(capture_delays_ms or []),
+            timing_nonce=timing_nonce,
             expires_at=_utcnow() + timedelta(seconds=ttl_seconds),
         )
         with self._lock:
@@ -354,6 +370,8 @@ class Store:
         action: Optional[str],
         expected_actions: List[str],
         ttl_seconds: int,
+        capture_delays_ms: Optional[List[int]] = None,
+        timing_nonce: Optional[str] = None,
     ) -> Optional[VerificationSession]:
         template = self.get_active_template(subject_type, subject_id)
         if template is None:
@@ -375,11 +393,12 @@ class Store:
                     INSERT INTO verification_sessions (
                         session_id, request_id, subject_type, subject_id, admin_id,
                         scene, business_event_id, record_id, action, template_id,
-                        template_version, expected_actions_json, upload_token,
+                        template_version, expected_actions_json, capture_delays_json,
+                        timing_nonce, upload_token,
                         upload_token_hash, status, result_code, issued_at, expires_at,
                         verified_at, proof_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', 'ISSUED', ?, ?, NULL, NULL)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', 'ISSUED', ?, ?, NULL, NULL)
                     """,
                     (
                         session_id,
@@ -394,6 +413,8 @@ class Store:
                         template.template_id,
                         template.template_version,
                         json.dumps(expected_actions),
+                        json.dumps(list(capture_delays_ms or [])),
+                        timing_nonce,
                         upload_token,
                         _token_hash(upload_token),
                         _to_iso(now),
@@ -407,6 +428,39 @@ class Store:
                     return self.get_session_by_request_id(request_id)
                 raise
         return self.get_session(session_id)
+
+    def recent_failed_action_names(
+        self,
+        subject_type: str,
+        subject_id: str,
+        scene: str,
+        limit: int,
+    ) -> List[str]:
+        if limit <= 0:
+            return []
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT action_results_json
+                FROM verification_sessions
+                WHERE subject_type = ?
+                  AND subject_id = ?
+                  AND scene = ?
+                  AND status = 'failed'
+                  AND action_results_json IS NOT NULL
+                ORDER BY verified_at DESC
+                LIMIT ?
+                """,
+                (subject_type, subject_id, scene, limit),
+            ).fetchall()
+        failed_actions: List[str] = []
+        known_actions = {"blink", "mouth_open", "shake_head", "nod_head", "smile"}
+        for row in rows:
+            for item in _action_results_from_json(row["action_results_json"]):
+                action = item.get("action")
+                if action in known_actions and item.get("passed") is False:
+                    failed_actions.append(str(action))
+        return failed_actions
 
     def get_session(self, session_id: str) -> Optional[VerificationSession]:
         with self._lock, self._connect() as conn:
@@ -752,6 +806,8 @@ class Store:
                         template_id TEXT NOT NULL,
                         template_version INTEGER NOT NULL,
                         expected_actions_json TEXT NOT NULL,
+                        capture_delays_json TEXT,
+                        timing_nonce TEXT,
                     upload_token TEXT NOT NULL,
                     upload_token_hash TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -793,6 +849,8 @@ class Store:
             _ensure_column(conn, "verification_sessions", "upload_token", "TEXT")
             _ensure_nullable_column(conn, "verification_sessions", "verifying_started_at", "TEXT")
             _ensure_nullable_column(conn, "verification_sessions", "action_results_json", "TEXT")
+            _ensure_nullable_column(conn, "verification_sessions", "capture_delays_json", "TEXT")
+            _ensure_nullable_column(conn, "verification_sessions", "timing_nonce", "TEXT")
 
 
 class MemoryStore(Store):
@@ -830,6 +888,8 @@ def _row_to_session(row: sqlite3.Row) -> VerificationSession:
         template_id=row["template_id"],
         template_version=int(row["template_version"]),
         expected_actions=list(json.loads(row["expected_actions_json"])),
+        capture_delays_ms=_json_int_list(row["capture_delays_json"]),
+        timing_nonce=row["timing_nonce"],
         upload_token=row["upload_token"],
         status=row["status"],
         result_code=row["result_code"],
@@ -840,6 +900,24 @@ def _row_to_session(row: sqlite3.Row) -> VerificationSession:
         proof_id=row["proof_id"],
         action_results=_action_results_from_json(row["action_results_json"]),
     )
+
+
+def _json_int_list(value: Optional[str]) -> List[int]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    result = []
+    for item in parsed:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 def _row_to_proof(row: sqlite3.Row) -> VerificationProof:

@@ -101,7 +101,7 @@ vm.createContext(context);
 vm.runInContext(appJs, context);
 
 const constants = vm.runInContext(
-  "({ CAPTURE_DURATION_MS, CAPTURE_INTERVAL_MS, ACTION_CAPTURE_INTERVAL_MS, CAPTURE_WIDTH, CAPTURE_JPEG_QUALITY, ACTION_SWITCH_PAUSE_MS })",
+  "({ CAPTURE_DURATION_MS, CAPTURE_INTERVAL_MS, ACTION_CAPTURE_INTERVAL_MS, CAPTURE_WIDTH, CAPTURE_JPEG_QUALITY, ACTION_SWITCH_PAUSE_MS, ACTION_GUIDANCE })",
   context,
 );
 assert(constants.CAPTURE_DURATION_MS === 2000, "capture duration must remain 2 seconds");
@@ -115,6 +115,12 @@ assert(
 assert(constants.CAPTURE_WIDTH === 360, "capture width must stay low-end friendly");
 assert(constants.CAPTURE_JPEG_QUALITY === 0.7, "JPEG quality must control payload size");
 assert(constants.ACTION_SWITCH_PAUSE_MS === 250, "action switch pause should stay short");
+assert(
+  constants.ACTION_GUIDANCE.blink.includes("再睁开"),
+  "blink guidance should tell users to reopen eyes",
+);
+assert(appJs.includes("timing_nonce: state.timingNonce"), "frontend must echo timing nonce");
+assert(appJs.includes("capture_delays_ms"), "frontend must consume server capture delays");
 
 const formatted = vm.runInContext(
   "formatErrorDetail([{ msg: 'List should have at least 1 item' }, { msg: 'Extra inputs are not permitted' }])",
