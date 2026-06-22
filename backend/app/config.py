@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     anti_spoofing_sample_frames: int = 6
     anti_spoofing_max_concurrent_inferences: int = 2
 
-    verification_max_concurrent_requests: int = 4
+    verification_max_concurrent_requests: int = 10
     verification_failure_limit_enabled: bool = True
     verification_failure_max_attempts: int = 5
     verification_failure_window_seconds: int = 300
