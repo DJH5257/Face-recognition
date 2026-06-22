@@ -420,8 +420,6 @@ function clearChallenge() {
   state.challengeId = null;
   state.actions = [];
   state.labels = {};
-  state.captureDelaysMs = [];
-  state.timingNonce = null;
   els.actionsText.textContent = "-";
   els.livenessText.textContent = "未检测";
   els.livenessText.className = "";
@@ -434,8 +432,6 @@ function finishChallengeCycle() {
   state.challengeId = null;
   state.actions = [];
   state.labels = {};
-  state.captureDelaysMs = [];
-  state.timingNonce = null;
   els.actionsText.textContent = "请重新生成动作";
 }
 

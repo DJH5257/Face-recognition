@@ -14,7 +14,7 @@ from uuid import uuid4
 import numpy as np
 
 from .config import get_settings
-from .template_crypto import TemplateCryptoError, embedding_from_blob, embedding_to_blob, is_encrypted_blob
+from .template_crypto import TemplateCryptoError, embedding_from_blob, embedding_to_blob
 
 
 def _utcnow() -> datetime:
@@ -48,10 +48,6 @@ def _embedding_to_blob(embedding: np.ndarray) -> tuple[bytes, int]:
 def _embedding_from_blob(blob: bytes, dimension: int) -> np.ndarray:
     settings = get_settings()
     return embedding_from_blob(blob, dimension, settings.template_encryption_key)
-
-
-def _template_blob_is_encrypted(blob: bytes) -> bool:
-    return is_encrypted_blob(blob)
 
 
 def _token_hash(value: str) -> str:
@@ -881,24 +877,6 @@ def _row_to_session(row: sqlite3.Row) -> VerificationSession:
         proof_id=row["proof_id"],
         action_results=_action_results_from_json(row["action_results_json"]),
     )
-
-
-def _json_int_list(value: Optional[str]) -> List[int]:
-    if not value:
-        return []
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(parsed, list):
-        return []
-    result = []
-    for item in parsed:
-        try:
-            result.append(int(item))
-        except (TypeError, ValueError):
-            continue
-    return result
 
 
 def _row_to_proof(row: sqlite3.Row) -> VerificationProof:
