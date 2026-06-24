@@ -7,6 +7,7 @@ import hashlib
 from pathlib import Path
 import secrets
 from threading import BoundedSemaphore
+from time import sleep
 from typing import Optional
 
 import cv2
@@ -18,6 +19,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .anti_spoofing import AntiSpoofingModel
+from .concurrency_metrics import ConcurrencyMetrics
 from .config import Settings, get_settings
 from .face_engine import FaceEngine, cosine_similarity, decode_base64_image, decode_image_bytes
 from .liveness import ACTION_LABELS, _extract_metrics, random_actions, verify_liveness_actions
@@ -32,6 +34,8 @@ from .schemas import (
     ProofFinalizeResponse,
     ProofIntrospectRequest,
     ProofIntrospectResponse,
+    SlotProbeRequest,
+    SlotProbeResponse,
     TemplateCreateRequest,
     TemplateCreateResponse,
     TemplateInfo,
@@ -46,6 +50,7 @@ from .schemas import (
 )
 from .stores import store
 from .template_crypto import TemplateCryptoError
+from .verification_slot import VerificationSlot
 
 
 settings = get_settings()
@@ -53,6 +58,7 @@ face_engine = FaceEngine(settings)
 anti_spoofing_model = AntiSpoofingModel(settings)
 failure_limiter = InMemoryFailureLimiter()
 verification_semaphore = BoundedSemaphore(max(1, settings.verification_max_concurrent_requests))
+verification_metrics = ConcurrencyMetrics(recent_window=settings.verification_metrics_window)
 
 app = FastAPI(title="Face Verification Liveness Demo")
 app.add_middleware(
@@ -60,6 +66,7 @@ app.add_middleware(
     allow_origins=settings.cors_origin_list,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Retry-After"],
 )
 
 static_dir = Path(__file__).resolve().parents[1] / "static"
@@ -251,6 +258,7 @@ def verify_liveness(payload: VerifyLivenessRequest) -> VerifyLivenessResponse:
         similarity=round(evaluation.similarity, 4) if evaluation.similarity is not None else None,
         threshold=settings.face_match_threshold,
         action_results=evaluation.action_results,
+        result_code=evaluation.result_code,
         message=evaluation.message,
     )
 
@@ -289,6 +297,29 @@ def _require_internal_api_key(x_face_api_key: str = Header(default="")) -> bool:
     if not secrets.compare_digest(x_face_api_key, settings.internal_api_key):
         raise HTTPException(status_code=401, detail="服务鉴权失败")
     return True
+
+
+@app.get("/v1/internal/runtime-stats")
+def runtime_stats(
+    _authorized: bool = Depends(_require_internal_api_key),
+) -> dict:
+    """内部状态查看接口：当前正在跑、累计拒绝、近期耗时分布。"""
+    snapshot = verification_metrics.snapshot()
+    snapshot["max_concurrent_requests"] = settings.verification_max_concurrent_requests
+    snapshot["slot_wait_seconds"] = settings.verification_slot_wait_seconds
+    return snapshot
+
+
+@app.post("/v1/internal/slot-probe", response_model=SlotProbeResponse)
+def slot_probe(
+    payload: SlotProbeRequest,
+    _authorized: bool = Depends(_require_internal_api_key),
+) -> SlotProbeResponse:
+    """内部并发槽位探针：只占用槽位，不跑模型，用于安全压测排队能力。"""
+    with _VerificationSlot():
+        if payload.hold_ms > 0:
+            sleep(payload.hold_ms / 1000.0)
+    return SlotProbeResponse(acquired=True, hold_ms=payload.hold_ms)
 
 
 @app.post("/v1/internal/templates", response_model=TemplateCreateResponse)
@@ -712,19 +743,19 @@ def _record_failure_limit_result(key: str, passed: bool, settings: Settings) -> 
 
 
 class _VerificationSlot:
+    """获取一个核验槽位，满了最多排队等 `verification_slot_wait_seconds`。"""
+
     def __enter__(self):
-        acquired = verification_semaphore.acquire(blocking=False)
-        if not acquired:
-            raise HTTPException(
-                status_code=503,
-                detail="当前人脸核验请求较多，请稍后重试",
-                headers={"Retry-After": "3"},
-            )
+        self._slot = VerificationSlot(
+            verification_semaphore,
+            verification_metrics,
+            lambda: settings.verification_slot_wait_seconds,
+        )
+        self._slot.__enter__()
         return self
 
     def __exit__(self, *_args):
-        verification_semaphore.release()
-        return False
+        return self._slot.__exit__(*_args)
 
 
 def _evaluate_liveness_frames(

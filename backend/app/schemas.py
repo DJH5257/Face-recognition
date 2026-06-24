@@ -57,6 +57,7 @@ class ActionResult(BaseModel):
 class VerifyLivenessResponse(BaseModel):
     challenge_id: str
     liveness_passed: bool
+    result_code: str
     anti_spoofing_passed: bool
     anti_spoofing_score: float
     face_matched: bool
@@ -171,6 +172,22 @@ class VerificationSessionVerifyResponse(BaseModel):
     threshold: Optional[float] = None
     action_results: List[ActionResult]
     message: str
+
+
+class SlotProbeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    hold_ms: int = Field(
+        default=250,
+        ge=0,
+        le=5000,
+        description="How long to hold a verification slot. Internal benchmark only.",
+    )
+
+
+class SlotProbeResponse(BaseModel):
+    acquired: bool
+    hold_ms: int
 
 
 class ProofIntrospectRequest(BaseModel):

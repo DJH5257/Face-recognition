@@ -28,10 +28,10 @@ class Settings(BaseSettings):
     face_match_embedding_sample: int = 5
 
     liveness_action_min_count: int = 1
-    liveness_action_max_count: int = 3
+    liveness_action_max_count: int = 2
     challenge_ttl_seconds: int = 180
     min_frames_per_action: int = 6
-    max_frames_per_action: int = 32
+    max_frames_per_action: int = 48
     max_total_frames: int = 90
     min_action_duration_ms: int = 1500
     max_action_duration_ms: int = 5000
@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     anti_spoofing_max_concurrent_inferences: int = 2
 
     verification_max_concurrent_requests: int = 10
+    verification_slot_wait_seconds: float = 3.0
+    verification_metrics_window: int = 200
     verification_failure_limit_enabled: bool = True
     verification_failure_max_attempts: int = 5
     verification_failure_window_seconds: int = 300

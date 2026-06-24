@@ -104,7 +104,7 @@ const constants = vm.runInContext(
   "({ CAPTURE_DURATION_MS, CAPTURE_INTERVAL_MS, ACTION_CAPTURE_INTERVAL_MS, CAPTURE_WIDTH, CAPTURE_JPEG_QUALITY, ACTION_SWITCH_PAUSE_MS, ACTION_GUIDANCE })",
   context,
 );
-assert(constants.CAPTURE_DURATION_MS === 2000, "capture duration must remain 2 seconds");
+assert(constants.CAPTURE_DURATION_MS === 3500, "capture duration must remain 3.5 seconds");
 assert(constants.CAPTURE_INTERVAL_MS === 200, "default capture interval must remain 200ms");
 assert(constants.ACTION_CAPTURE_INTERVAL_MS.blink === 80, "blink capture interval must be 80ms");
 assert(constants.ACTION_CAPTURE_INTERVAL_MS.mouth_open === 120, "mouth capture interval must be 120ms");

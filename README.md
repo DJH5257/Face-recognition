@@ -6,7 +6,7 @@
 
 - 上传一张本人基准人脸照片，使用 InsightFace / ArcFace 提取人脸特征。
 - 浏览器通过 `getUserMedia` 打开摄像头。
-- 后端随机生成 1-3 个动作：眨眼、张嘴、摇头、点头、微笑。
+- 后端随机生成 1-2 个动作：眨眼、张嘴、摇头、点头、微笑。
 - 前端按动作连续采集摄像头帧，后端用 MediaPipe FaceMesh 判断动作是否完成。
 - 活体检测通过后，才允许做 1:1 人脸特征比对。
 - 验证同时检查动作完成度、帧连续性、重复帧、人脸稳定性、防翻拍和人脸一致性。
@@ -114,15 +114,17 @@ FACE_DEMO_INSIGHTFACE_DET_SIZE=480
 FACE_DEMO_INSIGHTFACE_LIVE_DET_SIZE=320
 FACE_DEMO_FACE_MATCH_EMBEDDING_SAMPLE=5
 FACE_DEMO_VERIFICATION_MAX_CONCURRENT_REQUESTS=10
+FACE_DEMO_VERIFICATION_SLOT_WAIT_SECONDS=3
+FACE_DEMO_VERIFICATION_METRICS_WINDOW=200
 FACE_DEMO_VERIFICATION_FAILURE_LIMIT_ENABLED=1
 FACE_DEMO_VERIFICATION_FAILURE_MAX_ATTEMPTS=5
 FACE_DEMO_VERIFICATION_FAILURE_WINDOW_SECONDS=300
 FACE_DEMO_VERIFICATION_FAILURE_COOLDOWN_SECONDS=180
 FACE_DEMO_LIVENESS_ACTION_MIN_COUNT=1
-FACE_DEMO_LIVENESS_ACTION_MAX_COUNT=3
+FACE_DEMO_LIVENESS_ACTION_MAX_COUNT=2
 FACE_DEMO_LIVENESS_ACTION_WEIGHTS=mouth_open=24,shake_head=24,nod_head=24,blink=18,smile=18
 FACE_DEMO_MIN_FRAMES_PER_ACTION=6
-FACE_DEMO_MAX_FRAMES_PER_ACTION=32
+FACE_DEMO_MAX_FRAMES_PER_ACTION=48
 FACE_DEMO_MAX_TOTAL_FRAMES=90
 FACE_DEMO_MIN_UNIQUE_FRAME_RATIO=0.55
 FACE_DEMO_DUPLICATE_FRAME_HASH_SIZE=12
@@ -145,6 +147,30 @@ FACE_DEMO_ANTI_SPOOFING_MODEL_PATH=models/MiniFASNetV1SE.onnx,models/MiniFASNetV
 阈值需要用你的摄像头、光照、真人样本、照片、屏幕、视频回放和低性能设备重新校准。图像质量门禁会先拦截明显模糊、过暗、过曝、低对比度、脸过小、脸框明显越界或姿态明显偏转的登记照和活体抽样帧，避免烂图污染模板或进入重模型推理。
 
 生产环境建议设置 `FACE_DEMO_TEMPLATE_ENCRYPTION_KEY` 并开启 `FACE_DEMO_TEMPLATE_ENCRYPTION_REQUIRED=1`，这样新登记的人脸 embedding 会加密落库。旧明文模板仍可兼容读取，确认密钥配置无误后再逐步迁移。失败次数限制和验证并发保护为进程内实现，单机可以防止异常重试拖垮服务，多实例场景需要在网关层配合限流。
+
+并发相关配置：
+
+- `FACE_DEMO_VERIFICATION_MAX_CONCURRENT_REQUESTS`：同一时刻最多允许多少个核验请求进入重处理流程。
+- `FACE_DEMO_VERIFICATION_SLOT_WAIT_SECONDS`：并发满员时，新请求最多排队等待多少秒；超时后返回 503，并带 `Retry-After`。
+- `FACE_DEMO_VERIFICATION_METRICS_WINDOW`：内部运行指标保留最近多少次核验耗时样本。
+
+内部状态接口：
+
+```bash
+curl -H "X-Face-Api-Key: <internal-api-key>" \
+  http://127.0.0.1:8000/v1/internal/runtime-stats
+```
+
+安全槽位压测，不跑人脸模型：
+
+```bash
+python scripts/concurrency_benchmark.py \
+  --base-url http://127.0.0.1:8000 \
+  --internal-api-key <internal-api-key> \
+  --probe-only \
+  --probe-hold-ms 1000 \
+  --concurrencies 5 10 15
+```
 
 ## 生产部署建议
 
@@ -269,7 +295,7 @@ X-Face-Api-Key: ...
 }
 ```
 
-服务端按权重生成 1-3 个随机动作、绑定 active 模板并返回 `session_id`、`upload_token`、`actions` 和 `expires_at`。相同 `request_id` 会返回同一会话。
+服务端按权重生成 1-2 个随机动作、绑定 active 模板并返回 `session_id`、`upload_token`、`actions` 和 `expires_at`。相同 `request_id` 会返回同一会话。
 
 ### 生产：提交连续帧核验
 

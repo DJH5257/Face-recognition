@@ -15,7 +15,7 @@ const state = {
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 const MAX_UPLOAD_MB = MAX_UPLOAD_BYTES / 1024 / 1024;
 const ACCEPTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/bmp"]);
-const CAPTURE_DURATION_MS = 2000;
+const CAPTURE_DURATION_MS = 3500;
 const CAPTURE_INTERVAL_MS = 200;
 const ACTION_CAPTURE_INTERVAL_MS = Object.freeze({
   blink: 80,
