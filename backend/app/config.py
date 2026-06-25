@@ -45,8 +45,8 @@ class Settings(BaseSettings):
     mouth_mar_threshold: float = 0.34
     mouth_mar_delta_threshold: float = 0.07
     smile_delta_threshold: float = 0.028
-    shake_yaw_range_threshold: float = 16.0
-    nod_pitch_range_threshold: float = 10.0
+    shake_yaw_range_threshold: float = 14.0
+    nod_pitch_range_threshold: float = 8.0
 
     anti_spoofing_model_path: str = "models/MiniFASNetV1SE.onnx,models/MiniFASNetV2.yakhyo.onnx"
     anti_spoofing_model_scales: str = "4.0,2.7"
