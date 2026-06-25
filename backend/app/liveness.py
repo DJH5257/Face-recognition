@@ -206,6 +206,16 @@ def _judge_blink_action(action: str, ears: np.ndarray, settings: Settings) -> di
         and 0 < trough_index
         and closed_ratio <= 0.70
     )
+    strong_blink = (
+        drop >= drop_threshold * 1.8
+        and trough <= baseline * 0.65
+        and before_peak >= baseline * 0.80
+        and recovery_ok
+        and 0 < trough_index
+        and trough_index < len(smoothed) - 1
+        and closed_ratio <= 0.58
+    )
+    passed = passed or strong_blink
     return {
         "action": action,
         "passed": bool(passed),
@@ -214,7 +224,8 @@ def _judge_blink_action(action: str, ears: np.ndarray, settings: Settings) -> di
             f"EAR baseline={baseline:.3f}, trough={trough:.3f}, "
             f"drop={drop:.3f}/{drop_threshold:.3f}, "
             f"baseline_min={relaxed_baseline_threshold:.3f}, "
-            f"recovery={after_peak:.3f}, closed_ratio={closed_ratio:.0%}"
+            f"recovery={after_peak:.3f}, closed_ratio={closed_ratio:.0%}, "
+            f"strong_blink={strong_blink}"
         ),
     }
 
