@@ -144,6 +144,25 @@ FACE_DEMO_ANTI_SPOOFING_THRESHOLD=0.35
 FACE_DEMO_ANTI_SPOOFING_MODEL_PATH=models/MiniFASNetV1SE.onnx,models/MiniFASNetV2.yakhyo.onnx
 ```
 
+### 业务库直连（测试/生产）
+
+设置 `FACE_DEMO_BUSINESS_DB_ENABLED=1` 和 MySQL DSN 后，服务会直接读写 `chbzg` 业务库：
+
+- `fa_face_profile`：登记模板后同步模板 ID、版本和激活状态；创建核验会话前校验 active template。
+- `fa_face_verify_event`：创建 session、核验成功/失败和 proof 状态都会回写业务事件。
+- `fa_face_verify_consumption`：finalize 时在 MySQL 事务中唯一消费 `proof_id` 和 `business_event_id`，防止重放。
+- `fa_doctor_face_verify_log`、`fa_face_verify_regulator_status`：按实际存在的列写入核验/消费审计；`FACE_DEMO_BUSINESS_DB_STRICT_AUDIT=1` 时审计表写入失败会阻断请求。
+
+示例：
+
+```bash
+FACE_DEMO_BUSINESS_DB_ENABLED=1
+FACE_DEMO_BUSINESS_DB_DSN=mysql+pymysql://face_verify:<password>@10.0.0.10:3306/chbzg_test
+FACE_DEMO_BUSINESS_DB_STRICT_AUDIT=1
+```
+
+`/api/ready` 会检查 MySQL 连接和三张核心表的必需字段；未通过时返回 503。正式库和测试库必须使用不同 DSN、API key、模板加密密钥和数据库账号。表结构约定见 [chbzg 人脸核验接入实施方案](chbzg人脸核验接入实施方案与任务清单.md)。
+
 阈值需要用你的摄像头、光照、真人样本、照片、屏幕、视频回放和低性能设备重新校准。图像质量门禁会先拦截明显模糊、过暗、过曝、低对比度、脸过小、脸框明显越界或姿态明显偏转的登记照和活体抽样帧，避免烂图污染模板或进入重模型推理。
 
 生产环境建议设置 `FACE_DEMO_TEMPLATE_ENCRYPTION_KEY` 并开启 `FACE_DEMO_TEMPLATE_ENCRYPTION_REQUIRED=1`，这样新登记的人脸 embedding 会加密落库。旧明文模板仍可兼容读取，确认密钥配置无误后再逐步迁移。失败次数限制和验证并发保护为进程内实现，单机可以防止异常重试拖垮服务，多实例场景需要在网关层配合限流。

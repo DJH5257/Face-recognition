@@ -1,0 +1,18 @@
+[Unit]
+Description=Face verification service with direct chbzg test database access
+After=network.target
+
+[Service]
+Type=simple
+User=faceverify
+Group=faceverify
+WorkingDirectory=/opt/face-verify-demo/current
+EnvironmentFile=/opt/face-verify-demo/shared/env/testing.env
+ExecStart=/opt/face-verify-demo/shared/.venv/bin/uvicorn backend.app.main:app --host 127.0.0.1 --port 9004 --workers 1
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

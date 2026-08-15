@@ -16,6 +16,20 @@ class Settings(BaseSettings):
     template_encryption_key: str = ""
     template_encryption_required: bool = False
 
+    # Optional direct integration with the chbzg business database. When a DSN is
+    # configured, core fa_face_* reads and writes are mandatory and fail closed.
+    business_db_enabled: bool = False
+    business_db_dsn: str = ""
+    business_db_connect_timeout_seconds: int = 3
+    business_db_read_timeout_seconds: int = 5
+    business_db_write_timeout_seconds: int = 5
+    business_db_profile_table: str = "fa_face_profile"
+    business_db_event_table: str = "fa_face_verify_event"
+    business_db_consumption_table: str = "fa_face_verify_consumption"
+    business_db_log_table: str = "fa_doctor_face_verify_log"
+    business_db_regulator_table: str = "fa_face_verify_regulator_status"
+    business_db_strict_audit: bool = True
+
     insightface_model: str = "buffalo_l"
     insightface_root: str = "~/.insightface"
     insightface_det_size: int = 480
