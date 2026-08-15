@@ -19,7 +19,6 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .anti_spoofing import AntiSpoofingModel
-from .business_store import BusinessStore, BusinessStoreError
 from .concurrency_metrics import ConcurrencyMetrics
 from .config import Settings, get_settings
 from .face_engine import FaceEngine, cosine_similarity, decode_base64_image, decode_image_bytes
@@ -57,7 +56,6 @@ from .verification_slot import VerificationSlot
 settings = get_settings()
 face_engine = FaceEngine(settings)
 anti_spoofing_model = AntiSpoofingModel(settings)
-business_store = BusinessStore(settings)
 failure_limiter = InMemoryFailureLimiter()
 verification_semaphore = BoundedSemaphore(max(1, settings.verification_max_concurrent_requests))
 verification_metrics = ConcurrencyMetrics(recent_window=settings.verification_metrics_window)
@@ -124,14 +122,7 @@ def ready() -> dict:
     model_paths = _configured_model_paths(settings) + _configured_insightface_model_paths(settings)
     missing_models = [str(path) for path in model_paths if not path.exists()]
     database_parent = getattr(store, "database_path", Path("data/face_verify.sqlite3")).parent
-    business_schema = None
-    business_error = None
-    if business_store.enabled:
-        try:
-            business_schema = business_store.check_schema()
-        except BusinessStoreError as exc:
-            business_error = str(exc)
-    ok = database_parent.exists() and not missing_models and business_error is None
+    ok = database_parent.exists() and not missing_models
     if not ok:
         raise HTTPException(
             status_code=503,
@@ -139,35 +130,13 @@ def ready() -> dict:
                 "ok": False,
                 "database_parent_exists": database_parent.exists(),
                 "missing_models": missing_models,
-                "business_db": business_schema,
-                "business_db_error": business_error,
             },
         )
     return {
         "ok": True,
         "database_parent_exists": True,
         "missing_models": [],
-        "business_db": business_schema,
     }
-
-
-def _write_business_event_result(
-    session,
-    passed: bool,
-    result_code: str,
-    proof_id: Optional[str] = None,
-    action_results: Optional[list] = None,
-) -> None:
-    try:
-        business_store.record_event_result(
-            session,
-            passed,
-            result_code,
-            proof_id=proof_id,
-            action_results=action_results,
-        )
-    except BusinessStoreError as exc:
-        raise HTTPException(status_code=503, detail=f"业务数据库写入失败：{exc}") from exc
 
 
 @app.post("/api/enroll", response_model=EnrollResponse)
@@ -404,13 +373,8 @@ def create_template(
             source_type=payload.source_type,
             source_image_hash=source_hash,
         )
-        business_store.sync_profile(template)
     except TemplateCryptoError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except BusinessStoreError as exc:
-        if "template" in locals():
-            store.revoke_template(template.template_id)
-        raise HTTPException(status_code=503, detail=f"业务数据库写入失败：{exc}") from exc
     return TemplateCreateResponse(
         template_id=template.template_id,
         template_version=template.template_version,
@@ -465,8 +429,6 @@ def create_verification_session(
     payload: VerificationSessionCreateRequest,
     _authorized: bool = Depends(_require_internal_api_key),
 ) -> VerificationSessionCreateResponse:
-    if business_store.enabled and not payload.request_id:
-        raise HTTPException(status_code=400, detail="业务数据库模式必须提供 request_id")
     actions = _select_liveness_actions(
         settings,
         payload.subject_type,
@@ -490,43 +452,6 @@ def create_verification_session(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if session is None:
         raise HTTPException(status_code=404, detail="未找到有效人脸模板，请先登记基准人脸")
-
-    for field in (
-        "request_id",
-        "subject_type",
-        "subject_id",
-        "admin_id",
-        "scene",
-        "business_event_id",
-        "record_id",
-        "action",
-    ):
-        requested = getattr(payload, field)
-        existing = getattr(session, field)
-        if requested != existing:
-            raise HTTPException(status_code=409, detail=f"幂等请求字段冲突：{field}")
-
-    if business_store.enabled:
-        try:
-            profile = business_store.get_active_profile(payload.subject_type, payload.subject_id)
-            if not profile or str(profile.get("status", "")) != "active":
-                store.mark_session_failed(session.session_id, "FAIL_PROFILE_INACTIVE")
-                raise HTTPException(status_code=409, detail="业务库中没有有效的人脸模板映射")
-            mapped_template = profile.get("active_template_id")
-            if not mapped_template:
-                store.mark_session_failed(session.session_id, "FAIL_PROFILE_TEMPLATE_MISSING")
-                raise HTTPException(status_code=409, detail="业务库中没有 active template")
-            if str(mapped_template) != str(session.template_id):
-                store.mark_session_failed(session.session_id, "FAIL_PROFILE_TEMPLATE_MISMATCH")
-                raise HTTPException(status_code=409, detail="业务库模板映射与人脸服务模板不一致")
-            if session.status != "issued":
-                raise HTTPException(status_code=409, detail="幂等请求对应的核验会话已使用，请重新发起")
-            business_store.record_event_issued(session)
-        except HTTPException:
-            raise
-        except BusinessStoreError as exc:
-            store.mark_session_failed(session.session_id, "ERROR_BUSINESS_DB")
-            raise HTTPException(status_code=503, detail=f"业务数据库写入失败：{exc}") from exc
 
     background_tasks.add_task(_preload_anti_spoofing_model)
     return VerificationSessionCreateResponse(
@@ -557,36 +482,27 @@ def verify_verification_session(
         raise HTTPException(status_code=404, detail="核验会话不存在")
     if session.is_expired():
         store.mark_session_failed(session_id, "EXPIRED_SESSION")
-        _write_business_event_result(session, False, "EXPIRED_SESSION")
         raise HTTPException(status_code=410, detail="核验会话已过期，请重新发起")
     if session.status != "issued":
         raise HTTPException(status_code=409, detail="核验会话已使用，请重新发起")
 
     upload_token = _extract_bearer_token(authorization)
     if not upload_token or not store.verify_upload_token(session_id, upload_token):
-        _write_business_event_result(session, False, "INVALID_UPLOAD_TOKEN")
         raise HTTPException(status_code=401, detail="上传令牌无效")
 
     try:
         template = store.get_template(session.template_id)
     except TemplateCryptoError as exc:
-        _write_business_event_result(session, False, "ERROR_TEMPLATE_UNAVAILABLE")
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if template is None or template.status != "active":
         store.mark_session_failed(session_id, "FAIL_TEMPLATE_INVALID")
-        _write_business_event_result(session, False, "FAIL_TEMPLATE_INVALID")
         raise HTTPException(status_code=409, detail="人脸模板无效，请重新登记")
 
     failure_key = _failure_limit_key(session, _client_ip(request))
-    try:
-        _raise_if_failure_limited(failure_key, settings)
-    except HTTPException:
-        _write_business_event_result(session, False, "RATE_LIMITED")
-        raise
+    _raise_if_failure_limited(failure_key, settings)
 
     verification_attempt = store.start_session_verification(session_id)
     if not verification_attempt:
-        _write_business_event_result(session, False, "SESSION_ALREADY_USED")
         raise HTTPException(status_code=409, detail="核验会话已使用，请重新发起")
 
     try:
@@ -603,11 +519,9 @@ def verify_verification_session(
             store.reset_session_verification(session_id, verification_attempt)
         else:
             store.mark_session_failed(session_id, result_code, verification_attempt)
-            _write_business_event_result(session, False, result_code)
         raise
     except Exception as exc:
         store.mark_session_failed(session_id, "ERROR_INTERNAL", verification_attempt)
-        _write_business_event_result(session, False, "ERROR_INTERNAL")
         raise HTTPException(status_code=500, detail="核验处理失败，请稍后重试") from exc
 
     proof_id = None
@@ -620,7 +534,6 @@ def verify_verification_session(
             action_results=evaluation.action_results,
         )
         if proof is None:
-            _write_business_event_result(session, False, "ERROR_SESSION_STATE")
             raise HTTPException(status_code=409, detail="核验会话已超时，请重新提交")
         proof_id = proof.proof_id
     else:
@@ -631,13 +544,6 @@ def verify_verification_session(
             action_results=evaluation.action_results,
         )
     _record_failure_limit_result(failure_key, evaluation.passed, settings)
-    _write_business_event_result(
-        session,
-        evaluation.passed,
-        evaluation.result_code,
-        proof_id=proof_id,
-        action_results=evaluation.action_results,
-    )
 
     return VerificationSessionVerifyResponse(
         session_id=session_id,
@@ -677,17 +583,9 @@ def finalize_proof(
     _authorized: bool = Depends(_require_internal_api_key),
 ) -> ProofFinalizeResponse:
     try:
-        proof = store.get_proof(proof_id)
-        if proof is None:
-            raise HTTPException(status_code=404, detail="proof 不存在")
-        if proof.status == "ready" and proof.is_expired():
-            raise HTTPException(status_code=409, detail="proof 已过期")
-        business_store.consume_proof(proof, payload.business_event_id)
         proof = store.finalize_proof(proof_id, payload.business_event_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except BusinessStoreError as exc:
-        raise HTTPException(status_code=503, detail=f"业务数据库消费失败：{exc}") from exc
     if proof is None:
         raise HTTPException(status_code=404, detail="proof 不存在")
     return ProofFinalizeResponse(
