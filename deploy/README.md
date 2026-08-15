@@ -1,6 +1,6 @@
 # Test deployment
 
-The test service listens on `127.0.0.1:9004` and reads/writes the test chbzg MySQL database through the DSN in `testing.env.example`. Keep port 9004 behind the HTTPS reverse proxy; do not expose MySQL or the face service directly to the public network.
+The test service listens on `127.0.0.1:19004` and reads/writes the test chbzg MySQL database through the DSN in `testing.env.example`. Nginx terminates HTTPS on public port `9004` and proxies to `127.0.0.1:19004`; do not expose MySQL or Uvicorn directly to the public network.
 
 Before starting the service:
 
