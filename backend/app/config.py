@@ -16,6 +16,14 @@ class Settings(BaseSettings):
     template_encryption_key: str = ""
     template_encryption_required: bool = False
 
+    # Optional writer for the existing regulator result table only.
+    regulator_db_enabled: bool = False
+    regulator_db_dsn: str = ""
+    regulator_db_table: str = "fa_face_verify_regulator_status"
+    regulator_db_connect_timeout_seconds: int = 3
+    regulator_db_read_timeout_seconds: int = 5
+    regulator_db_write_timeout_seconds: int = 5
+
     insightface_model: str = "buffalo_l"
     insightface_root: str = "~/.insightface"
     insightface_det_size: int = 480

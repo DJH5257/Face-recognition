@@ -144,6 +144,18 @@ FACE_DEMO_ANTI_SPOOFING_THRESHOLD=0.35
 FACE_DEMO_ANTI_SPOOFING_MODEL_PATH=models/MiniFASNetV1SE.onnx,models/MiniFASNetV2.yakhyo.onnx
 ```
 
+### 监管结果表写入（可选）
+
+测试环境如需把医生核验结果写入已有的 `fa_face_verify_regulator_status`，只需配置监管库 DSN：
+
+```bash
+FACE_DEMO_REGULATOR_DB_ENABLED=1
+FACE_DEMO_REGULATOR_DB_DSN=mysql+pymysql://face_verify:<password>@127.0.0.1:3306/chbzg_test
+FACE_DEMO_REGULATOR_DB_TABLE=fa_face_verify_regulator_status
+```
+
+服务只写这一张表，不读取或修改其它 `fa_face_*` 表。写入字段与现有 DDL 一致：`business_event_id`、`record_id`、`subject_type`、`subject_id`、`scene`、`action`、`status`、`result_code`、`result_msg`、`created_at`、`updated_at`。`status` 使用 `success`、`failed`、`expired`，同一业务事件重复写入会更新结果而不会新增重复行。
+
 阈值需要用你的摄像头、光照、真人样本、照片、屏幕、视频回放和低性能设备重新校准。图像质量门禁会先拦截明显模糊、过暗、过曝、低对比度、脸过小、脸框明显越界或姿态明显偏转的登记照和活体抽样帧，避免烂图污染模板或进入重模型推理。
 
 生产环境建议设置 `FACE_DEMO_TEMPLATE_ENCRYPTION_KEY` 并开启 `FACE_DEMO_TEMPLATE_ENCRYPTION_REQUIRED=1`，这样新登记的人脸 embedding 会加密落库。旧明文模板仍可兼容读取，确认密钥配置无误后再逐步迁移。失败次数限制和验证并发保护为进程内实现，单机可以防止异常重试拖垮服务，多实例场景需要在网关层配合限流。

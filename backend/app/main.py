@@ -24,6 +24,7 @@ from .config import Settings, get_settings
 from .face_engine import FaceEngine, cosine_similarity, decode_base64_image, decode_image_bytes
 from .liveness import ACTION_LABELS, _extract_metrics, random_actions, verify_liveness_actions
 from .rate_limit import InMemoryFailureLimiter
+from .regulator_store import RegulatorStore, RegulatorStoreError
 from .schemas import (
     ChallengeRequest,
     ChallengeResponse,
@@ -56,6 +57,7 @@ from .verification_slot import VerificationSlot
 settings = get_settings()
 face_engine = FaceEngine(settings)
 anti_spoofing_model = AntiSpoofingModel(settings)
+regulator_store = RegulatorStore(settings)
 failure_limiter = InMemoryFailureLimiter()
 verification_semaphore = BoundedSemaphore(max(1, settings.verification_max_concurrent_requests))
 verification_metrics = ConcurrencyMetrics(recent_window=settings.verification_metrics_window)
@@ -122,7 +124,14 @@ def ready() -> dict:
     model_paths = _configured_model_paths(settings) + _configured_insightface_model_paths(settings)
     missing_models = [str(path) for path in model_paths if not path.exists()]
     database_parent = getattr(store, "database_path", Path("data/face_verify.sqlite3")).parent
-    ok = database_parent.exists() and not missing_models
+    regulator_schema = None
+    regulator_error = None
+    if regulator_store.enabled:
+        try:
+            regulator_schema = regulator_store.check_schema()
+        except RegulatorStoreError as exc:
+            regulator_error = str(exc)
+    ok = database_parent.exists() and not missing_models and regulator_error is None
     if not ok:
         raise HTTPException(
             status_code=503,
@@ -130,13 +139,23 @@ def ready() -> dict:
                 "ok": False,
                 "database_parent_exists": database_parent.exists(),
                 "missing_models": missing_models,
+                "regulator_db": regulator_schema,
+                "regulator_db_error": regulator_error,
             },
         )
     return {
         "ok": True,
         "database_parent_exists": True,
         "missing_models": [],
+        "regulator_db": regulator_schema,
     }
+
+
+def _write_regulator_result(session, status: str, result_code: str, result_msg: str) -> None:
+    try:
+        regulator_store.record_result(session, status, result_code, result_msg)
+    except RegulatorStoreError as exc:
+        raise HTTPException(status_code=503, detail=f"监管结果写入失败：{exc}") from exc
 
 
 @app.post("/api/enroll", response_model=EnrollResponse)
@@ -482,6 +501,7 @@ def verify_verification_session(
         raise HTTPException(status_code=404, detail="核验会话不存在")
     if session.is_expired():
         store.mark_session_failed(session_id, "EXPIRED_SESSION")
+        _write_regulator_result(session, "expired", "EXPIRED_SESSION", "核验会话已过期")
         raise HTTPException(status_code=410, detail="核验会话已过期，请重新发起")
     if session.status != "issued":
         raise HTTPException(status_code=409, detail="核验会话已使用，请重新发起")
@@ -519,9 +539,11 @@ def verify_verification_session(
             store.reset_session_verification(session_id, verification_attempt)
         else:
             store.mark_session_failed(session_id, result_code, verification_attempt)
+            _write_regulator_result(session, "failed", result_code, str(exc.detail))
         raise
     except Exception as exc:
         store.mark_session_failed(session_id, "ERROR_INTERNAL", verification_attempt)
+        _write_regulator_result(session, "failed", "ERROR_INTERNAL", "核验处理失败")
         raise HTTPException(status_code=500, detail="核验处理失败，请稍后重试") from exc
 
     proof_id = None
@@ -544,6 +566,12 @@ def verify_verification_session(
             action_results=evaluation.action_results,
         )
     _record_failure_limit_result(failure_key, evaluation.passed, settings)
+    _write_regulator_result(
+        session,
+        "success" if evaluation.passed else "failed",
+        evaluation.result_code,
+        evaluation.message,
+    )
 
     return VerificationSessionVerifyResponse(
         session_id=session_id,
