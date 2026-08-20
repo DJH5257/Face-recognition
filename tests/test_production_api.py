@@ -81,6 +81,7 @@ class ProductionApiTests(unittest.TestCase):
         self.original_store = main.store
         self.original_key = main.settings.internal_api_key
         self.original_insightface_root = main.settings.insightface_root
+        self.original_anti_spoofing_model_path = main.settings.anti_spoofing_model_path
         self.original_failure_max_attempts = main.settings.verification_failure_max_attempts
         self.original_failure_window_seconds = main.settings.verification_failure_window_seconds
         self.original_failure_cooldown_seconds = main.settings.verification_failure_cooldown_seconds
@@ -106,6 +107,17 @@ class ProductionApiTests(unittest.TestCase):
         ]:
             (model_dir / name).touch()
         main.settings.insightface_root = str(insightface_root)
+        anti_spoofing_dir = Path(self.tmp.name) / "anti-spoofing-models"
+        anti_spoofing_dir.mkdir(parents=True, exist_ok=True)
+        anti_spoofing_models = [
+            anti_spoofing_dir / "MiniFASNetV1SE.onnx",
+            anti_spoofing_dir / "MiniFASNetV2.yakhyo.onnx",
+        ]
+        for model_path in anti_spoofing_models:
+            model_path.touch()
+        main.settings.anti_spoofing_model_path = ",".join(
+            str(model_path) for model_path in anti_spoofing_models
+        )
         main.face_engine = FakeFaceEngine([FakeFace([1.0, 0.0])])
         main._validate_pose_quality = fake_quality
 
@@ -113,6 +125,7 @@ class ProductionApiTests(unittest.TestCase):
         main.store = self.original_store
         main.settings.internal_api_key = self.original_key
         main.settings.insightface_root = self.original_insightface_root
+        main.settings.anti_spoofing_model_path = self.original_anti_spoofing_model_path
         main.settings.verification_failure_max_attempts = self.original_failure_max_attempts
         main.settings.verification_failure_window_seconds = self.original_failure_window_seconds
         main.settings.verification_failure_cooldown_seconds = self.original_failure_cooldown_seconds

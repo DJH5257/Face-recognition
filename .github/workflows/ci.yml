@@ -30,7 +30,7 @@ jobs:
       - name: Run Python checks
         run: |
           PYTHONPYCACHEPREFIX=/tmp/face-verify-demo-pycache python -m py_compile backend/app/*.py tests/test_verification_guards.py
-          PYTHONPYCACHEPREFIX=/tmp/face-verify-demo-pycache python -m unittest discover -s tests -v
+          PYTHONPYCACHEPREFIX=/tmp/face-verify-demo-pycache python -m pytest -q
 
       - name: Run frontend static checks
         run: |

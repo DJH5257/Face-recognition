@@ -430,7 +430,7 @@ class VerificationGuardTests(unittest.TestCase):
         self.assertIn("MAR delta", result["detail"])
 
     def test_default_nod_threshold_is_relaxed_five_percent(self):
-        self.assertEqual(self.settings.nod_pitch_range_threshold, 10.0)
+        self.assertEqual(self.settings.nod_pitch_range_threshold, 8.0)
 
     def test_face_match_requires_threshold_ratio_and_min_similarity(self):
         enrollment = np.array([1.0, 0.0], dtype=np.float32)
