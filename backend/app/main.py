@@ -151,9 +151,22 @@ def ready() -> dict:
     }
 
 
-def _write_regulator_result(session, status: str, result_code: str, result_msg: str) -> None:
+def _write_regulator_result(
+    session,
+    status: str,
+    result_code: str,
+    result_msg: str,
+    request: Optional[Request] = None,
+) -> None:
     try:
-        regulator_store.record_result(session, status, result_code, result_msg)
+        regulator_store.record_result(
+            session,
+            status,
+            result_code,
+            result_msg,
+            client_ip=_client_ip(request) if request is not None else "",
+            user_agent=request.headers.get("user-agent", "") if request is not None else "",
+        )
     except RegulatorStoreError as exc:
         raise HTTPException(status_code=503, detail=f"监管结果写入失败：{exc}") from exc
 
@@ -499,16 +512,23 @@ def verify_verification_session(
     session = store.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="核验会话不存在")
-    if session.is_expired():
-        store.mark_session_failed(session_id, "EXPIRED_SESSION")
-        _write_regulator_result(session, "expired", "EXPIRED_SESSION", "核验会话已过期")
-        raise HTTPException(status_code=410, detail="核验会话已过期，请重新发起")
-    if session.status != "issued":
-        raise HTTPException(status_code=409, detail="核验会话已使用，请重新发起")
 
     upload_token = _extract_bearer_token(authorization)
     if not upload_token or not store.verify_upload_token(session_id, upload_token):
         raise HTTPException(status_code=401, detail="上传令牌无效")
+
+    if session.status != "issued":
+        raise HTTPException(status_code=409, detail="核验会话已使用，请重新发起")
+    if session.is_expired():
+        store.mark_session_failed(session_id, "EXPIRED_SESSION")
+        _write_regulator_result(
+            session,
+            "expired",
+            "EXPIRED_SESSION",
+            "核验会话已过期",
+            request,
+        )
+        raise HTTPException(status_code=410, detail="核验会话已过期，请重新发起")
 
     try:
         template = store.get_template(session.template_id)
@@ -516,6 +536,13 @@ def verify_verification_session(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if template is None or template.status != "active":
         store.mark_session_failed(session_id, "FAIL_TEMPLATE_INVALID")
+        _write_regulator_result(
+            session,
+            "failed",
+            "FAIL_TEMPLATE_INVALID",
+            "人脸模板无效，请重新登记",
+            request,
+        )
         raise HTTPException(status_code=409, detail="人脸模板无效，请重新登记")
 
     failure_key = _failure_limit_key(session, _client_ip(request))
@@ -539,11 +566,13 @@ def verify_verification_session(
             store.reset_session_verification(session_id, verification_attempt)
         else:
             store.mark_session_failed(session_id, result_code, verification_attempt)
-            _write_regulator_result(session, "failed", result_code, str(exc.detail))
+            _write_regulator_result(session, "failed", result_code, str(exc.detail), request)
         raise
     except Exception as exc:
         store.mark_session_failed(session_id, "ERROR_INTERNAL", verification_attempt)
-        _write_regulator_result(session, "failed", "ERROR_INTERNAL", "核验处理失败")
+        _write_regulator_result(
+            session, "failed", "ERROR_INTERNAL", "核验处理失败", request
+        )
         raise HTTPException(status_code=500, detail="核验处理失败，请稍后重试") from exc
 
     proof_id = None
@@ -571,6 +600,7 @@ def verify_verification_session(
         "success" if evaluation.passed else "failed",
         evaluation.result_code,
         evaluation.message,
+        request,
     )
 
     return VerificationSessionVerifyResponse(

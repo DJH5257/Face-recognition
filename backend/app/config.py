@@ -16,13 +16,15 @@ class Settings(BaseSettings):
     template_encryption_key: str = ""
     template_encryption_required: bool = False
 
-    # Optional writer for the existing regulator result table only.
+    # Optional writers for existing verification result tables.
     regulator_db_enabled: bool = False
     regulator_db_dsn: str = ""
     regulator_db_table: str = "fa_face_verify_regulator_status"
     regulator_db_connect_timeout_seconds: int = 3
     regulator_db_read_timeout_seconds: int = 5
     regulator_db_write_timeout_seconds: int = 5
+    doctor_face_log_enabled: bool = False
+    doctor_face_log_table: str = "fa_doctor_face_verify_log"
 
     insightface_model: str = "buffalo_l"
     insightface_root: str = "~/.insightface"
