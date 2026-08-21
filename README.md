@@ -41,7 +41,8 @@ face-verify-demo/
       liveness.py          # Random liveness actions and action checks
       anti_spoofing.py     # MiniFASNet ONNX inference
       schemas.py           # API request / response models
-      stores.py            # Demo 内存 enrollment/challenge + SQLite template/session/proof store
+      stores.py            # Demo 内存状态 + SQLite 本地后备
+      mysql_store.py       # MySQL template/session/proof 状态存储
     static/
       index.html
       styles.css
@@ -144,6 +145,29 @@ FACE_DEMO_ANTI_SPOOFING_THRESHOLD=0.35
 FACE_DEMO_ANTI_SPOOFING_MODEL_PATH=models/MiniFASNetV1SE.onnx,models/MiniFASNetV2.yakhyo.onnx
 ```
 
+### MySQL 状态存储
+
+测试和生产环境应将模板、核验会话和一次性 proof 保存到 MySQL，SQLite 只作为本地开发和单元测试后备：
+
+```bash
+FACE_DEMO_STATE_DB_DSN=mysql+pymysql://face_verify:<password>@127.0.0.1:3306/chbzg_test
+FACE_DEMO_STATE_DB_TEMPLATE_TABLE=fa_face_service_template
+FACE_DEMO_STATE_DB_SESSION_TABLE=fa_face_service_session
+FACE_DEMO_STATE_DB_PROOF_TABLE=fa_face_service_proof
+```
+
+三张服务内部表与业务侧 `fa_face_profile`、`fa_face_verify_event`、`fa_face_verify_consumption` 分工不同。内部表保存加密向量、上传令牌、随机动作和 proof 状态；业务表继续由 PHP 负责登录策略、业务事件和 proof 消费，不能互相替代。
+
+首次从 SQLite 切换前，先备份原文件，再执行幂等迁移：
+
+```bash
+cp data/face_verify.sqlite3 data/face_verify.sqlite3.before-mysql
+python scripts/migrate_sqlite_state_to_mysql.py --source data/face_verify.sqlite3
+python scripts/migrate_sqlite_state_to_mysql.py --source data/face_verify.sqlite3 --check-only
+```
+
+迁移遇到相同主键但内容不同会整批回滚，不会覆盖目标记录。迁移后原 SQLite 文件仅作为回滚备份，不再被已配置 MySQL DSN 的服务读写。
+
 ### 监管结果表写入（可选）
 
 测试环境如需把医生核验结果写入已有的 `fa_face_verify_regulator_status`，只需配置监管库 DSN：
@@ -242,7 +266,7 @@ GET /api/health
 GET /api/ready
 ```
 
-`/api/health` 只表示进程可响应。`/api/ready` 会检查 SQLite 数据目录和 PAD 模型文件是否存在，不会预加载 InsightFace 或 PAD 大模型，避免探活拖慢低配机器。
+`/api/health` 只表示进程可响应。`/api/ready` 会检查当前状态存储的三张表、监管/医生日志表和 PAD 模型文件；使用本地后备时则检查 SQLite 数据目录。探活不会预加载 InsightFace 或 PAD 大模型，避免拖慢低配机器。
 
 ### 生产接口鉴权
 

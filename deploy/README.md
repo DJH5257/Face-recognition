@@ -6,8 +6,9 @@ Before starting the service:
 
 1. Install `requirements.txt` in the shared virtual environment.
 2. Copy `testing.env.example` to the server's environment directory and replace every `CHANGE_ME` value.
-3. Verify `/api/ready` returns both enabled result-table schemas and `ok: true`.
-4. Run a failed verification and a passed verification against a test doctor, then correlate `fa_face_verify_regulator_status` and `fa_doctor_face_verify_log` by `business_event_id`.
+3. Back up the SQLite state file and run `scripts/migrate_sqlite_state_to_mysql.py` before setting `FACE_DEMO_STATE_DB_DSN` for the first time.
+4. Verify `/api/ready` reports the three `fa_face_service_*` state tables, both enabled result-table schemas and `ok: true`.
+5. Run a failed verification and a passed verification against a test doctor, then correlate `fa_face_verify_regulator_status` and `fa_doctor_face_verify_log` by `business_event_id`.
 
 The business login policy must keep `face_required=false` for non-doctor flows. For a doctor, after password verification, return the face session's `verify_url`, `session_id`, `upload_token`, actions and labels; the browser then uploads frames to port `9004` and completes the login proof through the existing business callback.
 

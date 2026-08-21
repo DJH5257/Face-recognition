@@ -8,6 +8,13 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="FACE_DEMO_")
 
     database_path: str = "data/face_verify.sqlite3"
+    state_db_dsn: str = ""
+    state_db_template_table: str = "fa_face_service_template"
+    state_db_session_table: str = "fa_face_service_session"
+    state_db_proof_table: str = "fa_face_service_proof"
+    state_db_connect_timeout_seconds: int = 3
+    state_db_read_timeout_seconds: int = 5
+    state_db_write_timeout_seconds: int = 5
     internal_api_key: str = "change-me-face-internal-key"
     cors_origins: str = "*"
     verification_session_ttl_seconds: int = 300

@@ -123,7 +123,14 @@ def health() -> dict:
 def ready() -> dict:
     model_paths = _configured_model_paths(settings) + _configured_insightface_model_paths(settings)
     missing_models = [str(path) for path in model_paths if not path.exists()]
-    database_parent = getattr(store, "database_path", Path("data/face_verify.sqlite3")).parent
+    database_path = getattr(store, "database_path", None)
+    database_parent_exists = database_path is None or database_path.parent.exists()
+    state_store_schema = None
+    state_store_error = None
+    try:
+        state_store_schema = store.check_schema()
+    except Exception as exc:
+        state_store_error = str(exc)
     regulator_schema = None
     regulator_error = None
     if regulator_store.enabled:
@@ -131,14 +138,21 @@ def ready() -> dict:
             regulator_schema = regulator_store.check_schema()
         except RegulatorStoreError as exc:
             regulator_error = str(exc)
-    ok = database_parent.exists() and not missing_models and regulator_error is None
+    ok = (
+        database_parent_exists
+        and not missing_models
+        and state_store_error is None
+        and regulator_error is None
+    )
     if not ok:
         raise HTTPException(
             status_code=503,
             detail={
                 "ok": False,
-                "database_parent_exists": database_parent.exists(),
+                "database_parent_exists": database_parent_exists,
                 "missing_models": missing_models,
+                "state_store": state_store_schema,
+                "state_store_error": state_store_error,
                 "regulator_db": regulator_schema,
                 "regulator_db_error": regulator_error,
             },
@@ -147,6 +161,7 @@ def ready() -> dict:
         "ok": True,
         "database_parent_exists": True,
         "missing_models": [],
+        "state_store": state_store_schema,
         "regulator_db": regulator_schema,
     }
 

@@ -188,6 +188,8 @@ class VerificationProof:
 
 
 class Store:
+    backend_name = "sqlite"
+
     def __init__(self, database_path: Optional[str] = None) -> None:
         settings = get_settings()
         self.database_path = Path(database_path or settings.database_path).expanduser()
@@ -831,6 +833,26 @@ class Store:
             _ensure_nullable_column(conn, "verification_sessions", "verifying_started_at", "TEXT")
             _ensure_nullable_column(conn, "verification_sessions", "action_results_json", "TEXT")
 
+    def check_schema(self) -> Dict[str, object]:
+        with self._lock, self._connect() as conn:
+            tables = {}
+            for table_name, required in (
+                ("face_templates", _SQLITE_TEMPLATE_COLUMNS),
+                ("verification_sessions", _SQLITE_SESSION_COLUMNS),
+                ("verification_proofs", _SQLITE_PROOF_COLUMNS),
+            ):
+                columns = {
+                    str(row["name"])
+                    for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+                }
+                missing = sorted(required - columns)
+                if missing:
+                    raise RuntimeError(
+                        f"SQLite 状态表 {table_name} 缺少字段：{', '.join(missing)}"
+                    )
+                tables[table_name] = {"table": table_name, "columns": sorted(columns)}
+        return {"backend": self.backend_name, "tables": tables}
+
 
 class MemoryStore(Store):
     """Compatibility alias for tests and older demo imports."""
@@ -904,4 +926,32 @@ def _row_to_proof(row: sqlite3.Row) -> VerificationProof:
     )
 
 
-store = MemoryStore()
+_SQLITE_TEMPLATE_COLUMNS = {
+    "template_id", "subject_type", "subject_id", "embedding_blob",
+    "embedding_dimension", "bbox_json", "template_version", "status",
+    "source_type", "source_image_hash", "created_at", "activated_at", "revoked_at",
+}
+_SQLITE_SESSION_COLUMNS = {
+    "session_id", "request_id", "subject_type", "subject_id", "admin_id", "scene",
+    "business_event_id", "record_id", "action", "template_id", "template_version",
+    "expected_actions_json", "upload_token", "upload_token_hash", "status", "result_code",
+    "issued_at", "expires_at", "verifying_started_at", "verified_at", "proof_id",
+    "action_results_json",
+}
+_SQLITE_PROOF_COLUMNS = {
+    "proof_id", "session_id", "business_event_id", "subject_type", "subject_id",
+    "admin_id", "scene", "record_id", "action", "template_id", "template_version",
+    "status", "result_code", "issued_at", "expires_at", "finalized_at",
+}
+
+
+def _build_store():
+    settings = get_settings()
+    if settings.state_db_dsn.strip():
+        from .mysql_store import MySQLStore
+
+        return MySQLStore(settings)
+    return MemoryStore()
+
+
+store = _build_store()
