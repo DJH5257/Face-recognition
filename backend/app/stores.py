@@ -17,6 +17,16 @@ from .config import get_settings
 from .template_crypto import TemplateCryptoError, embedding_from_blob, embedding_to_blob
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """Preserve transaction handling and close each SQLite file handle."""
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -743,7 +753,12 @@ class Store:
 
     def _connect(self) -> sqlite3.Connection:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self.database_path), timeout=15, isolation_level=None)
+        conn = sqlite3.connect(
+            str(self.database_path),
+            timeout=15,
+            isolation_level=None,
+            factory=_ClosingConnection,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=15000")
         conn.execute("PRAGMA foreign_keys=ON")
